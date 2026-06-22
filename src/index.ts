@@ -27,3 +27,18 @@ export {
   waits,
   isTenpai,
 } from './win.js';
+
+export type { RuleConfig } from './rule.js';
+export { DEFAULT_RULE } from './rule.js';
+
+export type {
+  MeldKind,
+  ParsedMeld,
+  Decomposition,
+  WaitType,
+  Interpretation,
+} from './decompose.js';
+export { decomposeStandard, interpretWaits } from './decompose.js';
+
+export type { CalledMeld, WinInput, YakuHan, WinResult } from './yaku.js';
+export { evaluateWin } from './yaku.js';

@@ -31,5 +31,5 @@ npm run typecheck # tsc --noEmit
 
 ## 実装フェーズ（ADR-0004）
 
-Phase 1: 牌・PRNG・**和了形判定・待ち列挙**（実装済み）→ Phase 2: 役判定 → Phase 3: 符・点数 → Phase 4: 局進行の完全実装。
-役・点数の取りこぼしは ADR ではなく `tests/` のテスト表で管理する。
+Phase 1: 牌・PRNG・**和了形判定・待ち列挙**（実装済み）→ Phase 2: **役判定**（実装済み: 通常役一式＋役満＋ドラ集計、高点法。`evaluateWin`）→ Phase 3: 符・点数（`WinResult.fu` は現状 null）→ Phase 4: 局進行の完全実装。
+役・点数の取りこぼしは ADR ではなく `tests/` のテスト表で管理する。Phase 3 未実装: 符計算・点数・切り上げ・本場/供託、連風牌雀頭符、流し満貫。
