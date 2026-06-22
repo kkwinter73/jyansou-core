@@ -15,6 +15,7 @@ export {
   countsToString,
   parseHand,
   totalTiles,
+  tilesToCounts,
 } from './tiles.js';
 
 export { makeRng, nextRng, nextInt, shuffle } from './rng.js';
@@ -48,3 +49,23 @@ export { computeFu } from './fu.js';
 
 export type { ScoreResult, PaymentBreakdown } from './score.js';
 export { basePoints, computeScore } from './score.js';
+
+export type {
+  Meld,
+  PlayerState,
+  Phase,
+  GameResult,
+  GameState,
+  Action,
+  GameEvent,
+  RankEntry,
+  NextHand,
+} from './game.js';
+export {
+  createGame,
+  legalActions,
+  apply,
+  seatWindOf,
+  finalRanking,
+  startNextHand,
+} from './game.js';

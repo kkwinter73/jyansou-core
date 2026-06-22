@@ -91,3 +91,10 @@ export function countsToString(counts: Counts): string {
 export function totalTiles(counts: Counts): number {
   return counts.reduce((a, b) => a + b, 0);
 }
+
+/** 物理牌の配列を枚数ベクトルへ。 */
+export function tilesToCounts(tiles: readonly { kind: TileKind }[]): Counts {
+  const counts: Counts = new Array(NUM_KINDS).fill(0);
+  for (const t of tiles) counts[t.kind]++;
+  return counts;
+}
