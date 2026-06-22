@@ -42,3 +42,9 @@ export { decomposeStandard, interpretWaits } from './decompose.js';
 
 export type { CalledMeld, WinInput, YakuHan, WinResult } from './yaku.js';
 export { evaluateWin } from './yaku.js';
+
+export type { FuInput } from './fu.js';
+export { computeFu } from './fu.js';
+
+export type { ScoreResult, PaymentBreakdown } from './score.js';
+export { basePoints, computeScore } from './score.js';

@@ -12,6 +12,8 @@ import {
   type WaitType,
 } from './decompose.js';
 import { DEFAULT_RULE, type RuleConfig } from './rule.js';
+import { computeFu } from './fu.js';
+import { basePoints, computeScore, type ScoreResult } from './score.js';
 
 export interface CalledMeld {
   type: 'chi' | 'pon' | 'minkan' | 'kakan' | 'ankan';
@@ -38,6 +40,10 @@ export interface WinInput {
   doraIndicators?: TileKind[];
   uraIndicators?: TileKind[];
   redCount?: number; // 赤ドラ枚数（手牌+副露）
+  /** 和了者が親か。省略時は seatWind==='E' から判定。 */
+  isDealer?: boolean;
+  honba?: number; // 本場
+  riichiSticks?: number; // 場の供託リーチ棒の本数
   rule?: RuleConfig;
 }
 
@@ -51,10 +57,12 @@ export interface WinResult {
   yakuman: YakuHan[]; // 役満（han に倍数 1 or 2）
   yakumanTotal: number; // 役満倍数合計（0=非役満）
   han: number; // 通常時の翻合計（役+ドラ）。役満時は 0
-  fu: number | null; // Phase 3
+  fu: number; // 符（役満時は便宜上0）
+  base: number; // 基本点
   dora: { dora: number; aka: number; ura: number };
   menzen: boolean;
   waitType: WaitType;
+  score: ScoreResult; // 点の動き（本場・供託込み）
 }
 
 const WIND_KIND: Record<Wind, TileKind> = { E: 27, S: 28, W: 29, N: 30 };
@@ -263,7 +271,7 @@ function sumHan(list: YakuHan[]): number {
 }
 
 /** 七対子の役判定（門前固定・単騎）。 */
-function detectChiitoitsu(used: Counts, input: WinInput, rule: RuleConfig): StructuralResult {
+function detectChiitoitsu(used: Counts, rule: RuleConfig): StructuralResult {
   const yaku: YakuHan[] = [{ name: '七対子', han: 2 }];
   const yakuman: YakuHan[] = [];
   const present: TileKind[] = [];
@@ -322,30 +330,29 @@ export function evaluateWin(input: WinInput): WinResult | null {
   const doraHan = dora.dora + dora.aka + dora.ura;
 
   const ctx = contextYaku(input, menzen);
+  const isDealer = input.isDealer ?? input.seatWind === 'E';
+  const honba = input.honba ?? 0;
+  const sticks = input.riichiSticks ?? 0;
+
+  type Cand = { yaku: YakuHan[]; yakuman: YakuHan[]; waitType: WaitType; fu: number };
+  const cands: Cand[] = [];
 
   // --- 国士無双（門前・副露なし）---
   if (called.length === 0 && isKokushi(input.concealed)) {
-    const thirteen =
-      input.concealed[input.winTile] === 2; // 和了牌が雀頭側＝13面待ち
-    return {
+    const thirteen = input.concealed[input.winTile] === 2; // 和了牌が雀頭側＝13面待ち
+    const dbl = thirteen && rule.doubleYakuman;
+    cands.push({
       yaku: [],
-      yakuman: [{ name: thirteen && rule.doubleYakuman ? '国士無双十三面' : '国士無双', han: thirteen && rule.doubleYakuman ? 2 : 1 }],
-      yakumanTotal: thirteen && rule.doubleYakuman ? 2 : 1,
-      han: 0,
-      fu: null,
-      dora,
-      menzen,
+      yakuman: [{ name: dbl ? '国士無双十三面' : '国士無双', han: dbl ? 2 : 1 }],
       waitType: 'tanki',
-    };
+      fu: 0,
+    });
   }
-
-  type Cand = { yaku: YakuHan[]; yakuman: YakuHan[]; waitType: WaitType };
-  const cands: Cand[] = [];
 
   // --- 七対子 ---
   if (called.length === 0 && isChiitoitsu(input.concealed)) {
-    const r = detectChiitoitsu(used, input, rule);
-    cands.push({ ...r, waitType: 'tanki' });
+    const r = detectChiitoitsu(used, rule);
+    cands.push({ ...r, waitType: 'tanki', fu: 25 });
   }
 
   // --- 標準形（全分解 × 待ち解釈）---
@@ -354,47 +361,54 @@ export function evaluateWin(input: WinInput): WinResult | null {
     const interps = interpretWaits(dec.melds, dec.pair, calledParsed, input.winTile, !input.byTsumo);
     for (const interp of interps) {
       const r = detectStructural(interp, used, menzen, input, rule);
-      cands.push({ ...r, waitType: interp.waitType });
+      const fu = computeFu({
+        melds: interp.melds,
+        pair: interp.pair,
+        waitType: interp.waitType,
+        byTsumo: input.byTsumo,
+        menzen,
+        seatWind: input.seatWind,
+        roundWind: input.roundWind,
+        pinfu: r.yaku.some((y) => y.name === '平和'),
+        chiitoitsu: false,
+      });
+      cands.push({ ...r, waitType: interp.waitType, fu });
     }
   }
 
   if (cands.length === 0) return null; // 和了形でない
 
-  // 文脈役を各候補に合算してから高点法で選ぶ
+  // 文脈役を合算し、基本点（=翻と符）で高点法選択する
   const scored = cands.map((c) => {
     if (ctx.yakuman.length || c.yakuman.length) {
       const yakuman = [...c.yakuman, ...ctx.yakuman];
-      return { c, yakuman, yaku: [] as YakuHan[], score: 100000 + sumHan(yakuman) };
+      const yakumanTotal = sumHan(yakuman);
+      return {
+        c, yakuman, yaku: [] as YakuHan[], yakumanTotal,
+        han: 0, base: basePoints(0, c.fu, yakumanTotal),
+      };
     }
     const yaku = [...c.yaku, ...ctx.yaku];
-    return { c, yakuman: [] as YakuHan[], yaku, score: sumHan(yaku) };
+    const han = sumHan(yaku) + doraHan;
+    return { c, yakuman: [] as YakuHan[], yaku, yakumanTotal: 0, han, base: basePoints(han, c.fu, 0) };
   });
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => b.yakumanTotal - a.yakumanTotal || b.base - a.base);
   const best = scored[0];
 
   // 役なし（ドラのみ）は和了不可
-  if (best.yakuman.length === 0 && best.yaku.length === 0) return null;
+  if (best.yakumanTotal === 0 && best.yaku.length === 0) return null;
 
-  if (best.yakuman.length > 0) {
-    return {
-      yaku: [],
-      yakuman: best.yakuman,
-      yakumanTotal: sumHan(best.yakuman),
-      han: 0,
-      fu: null,
-      dora,
-      menzen,
-      waitType: best.c.waitType,
-    };
-  }
+  const score = computeScore(best.base, isDealer, input.byTsumo, honba, sticks);
   return {
     yaku: best.yaku,
-    yakuman: [],
-    yakumanTotal: 0,
-    han: sumHan(best.yaku) + doraHan,
-    fu: null,
+    yakuman: best.yakuman,
+    yakumanTotal: best.yakumanTotal,
+    han: best.han,
+    fu: best.c.fu,
+    base: best.base,
     dora,
     menzen,
     waitType: best.c.waitType,
+    score,
   };
 }
