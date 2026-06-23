@@ -8,7 +8,10 @@ const conserved = (s: GameState) => s.scores.reduce((a, b) => a + b, 0) + s.riic
 function finishHand(start: GameState): GameState {
   let s = start;
   for (let guard = 0; guard < 400 && s.phase !== 'over'; guard++) {
-    const seat = s.phase === 'afterDiscard' ? s.pendingRon[0] : s.turn;
+    const seat =
+      s.phase === 'afterDiscard' || s.phase === 'afterKakan'
+        ? s.pendingCalls.find((p) => !s.callResponses[p.seat])!.seat
+        : s.turn;
     const action = chooseAction(s, seat);
     expect(legalActions(s, seat)).toContainEqual(action); // 必ず合法手
     s = apply(s, action).state;

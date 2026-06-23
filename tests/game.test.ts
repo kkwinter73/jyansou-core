@@ -50,8 +50,9 @@ describe('完全な局ループ（ツモ切りボット）— 点数保存', () 
         const acts = legalActions(s, s.turn);
         const tsumo = acts.find((a) => a.type === 'tsumo');
         s = apply(s, tsumo ?? { type: 'discard', tile: s.drawnTile! }).state;
-      } else if (s.phase === 'afterDiscard') {
-        s = apply(s, { type: 'pass', seat: s.pendingRon[0] }).state;
+      } else if (s.phase === 'afterDiscard' || s.phase === 'afterKakan') {
+        const pc = s.pendingCalls.find((p) => !s.callResponses[p.seat])!;
+        s = apply(s, { type: 'pass', seat: pc.seat }).state;
       }
     }
     return s;
@@ -97,15 +98,17 @@ describe('ロンとフリテン', () => {
   function ronSetup(seat2Discards: Tile[]): GameState {
     const seat0 = tilesFromHand('5p19m19p19s1234567z'); // 14枚（非和了）。5pを捨てる
     const seat2 = tilesFromHand('234567m234p67p55s'); // 13枚・5p/8p待ち（門前タンヤオ平和）
-    const base = structuredClone(createGame(1));
+    // seat1/seat3 は 5p をポン/チー/ロンできない手（ピンズ無し・5p無し）にして候補を seat2 に限定
+    const seat1 = tilesFromHand('123m456m789m99s12z');
+    const seat3 = tilesFromHand('123s456s789s99m12z');
     return craftedState({
       turn: 0,
       phase: 'discard',
       hands: [
         { concealed: seat0, melds: [] },
-        base.hands[1],
+        { concealed: seat1, melds: [] },
         { concealed: seat2, melds: [] },
-        base.hands[3],
+        { concealed: seat3, melds: [] },
       ],
       discards: [[], [], seat2Discards, []],
       drawnTile: find(seat0, 13),
@@ -116,7 +119,7 @@ describe('ロンとフリテン', () => {
     const s = ronSetup([]);
     const afterDiscard = apply(s, { type: 'discard', tile: find(s.hands[0].concealed, 13) }).state;
     expect(afterDiscard.phase).toBe('afterDiscard');
-    expect(afterDiscard.pendingRon).toContain(2);
+    expect(afterDiscard.pendingCalls.map((p) => p.seat)).toContain(2);
     expect(legalActions(afterDiscard, 2).some((a) => a.type === 'ron')).toBe(true);
 
     const { state } = apply(afterDiscard, { type: 'ron', seat: 2 });
@@ -133,7 +136,7 @@ describe('ロンとフリテン', () => {
   it('河フリテン: 待ち牌(8p)が自分の河にあるとロン不可', () => {
     const s = ronSetup([T(16)]); // 8p を河に置く → フリテン
     const after = apply(s, { type: 'discard', tile: find(s.hands[0].concealed, 13) }).state;
-    expect(after.pendingRon).not.toContain(2);
+    expect(after.pendingCalls.map((p) => p.seat)).not.toContain(2);
     expect(after.phase).toBe('draw'); // ロンが無いので次の手番へ
     expect(after.turn).toBe(1);
   });

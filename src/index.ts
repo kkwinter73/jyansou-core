@@ -55,6 +55,7 @@ export type {
   PlayerState,
   Phase,
   GameResult,
+  PendingCall,
   GameState,
   Action,
   GameEvent,

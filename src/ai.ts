@@ -66,7 +66,8 @@ export function chooseAction(state: GameState, seat: Seat): Action {
 
   if (state.phase === 'draw') return { type: 'draw' };
 
-  if (state.phase === 'afterDiscard') {
+  // 鳴き局面: 和了（ロン/チャンカン）できるなら取る。鳴き（ポン/チー/カン）はv1では開始しない。
+  if (state.phase === 'afterDiscard' || state.phase === 'afterKakan') {
     return acts.find((a) => a.type === 'ron') ?? { type: 'pass', seat };
   }
 

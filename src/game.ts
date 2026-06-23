@@ -1,19 +1,19 @@
-// 局進行（Phase 4a: 鳴きなしの完全ループ）。設計: game-flow-design.md, ADR-0006/0007。
+// 局進行（Phase 4a 鳴きなし + Phase 4b 鳴き）。設計: game-flow-design.md, ADR-0006/0007。
 // 状態は不変。遷移は apply(state, action) -> { state, events } の純粋関数。
-// 鳴き（チー/ポン/カン）は Phase 4b。ここでは draw/discard(+riichi)/tsumo/ron/pass を扱う。
+// 鳴き: チー/ポン/大明槓/暗槓/加槓。優先順位 ロン > ポン/カン > チー。嶺上ツモ・カンドラ・槍槓・喰い替え防止。
+// 制限(v1): リーチ中の暗槓は不可（送り槓の待ち不変判定を避け安全側に倒す）。途中流局・流し満貫は未対応。
 import type { Tile, Seat, Wind, TileKind } from './types.js';
 import type { RngState } from './state.js';
 import { DEFAULT_RULE, type RuleConfig } from './rule.js';
 import { makeRng, shuffle } from './rng.js';
 import { tilesToCounts } from './tiles.js';
 import { isWinningHand, isTenpai, waits } from './win.js';
-import { evaluateWin, type WinInput, type WinResult } from './yaku.js';
+import { evaluateWin, type WinInput, type WinResult, type CalledMeld } from './yaku.js';
 
 export interface Meld {
-  /** Phase 4b で使用。4a では常に空。 */
   type: 'chi' | 'pon' | 'minkan' | 'kakan' | 'ankan';
-  tiles: Tile[];
-  from: Seat | null;
+  tiles: Tile[]; // chi/pon=3, kan=4
+  from: Seat | null; // 鳴いた相手（ankan は null）
 }
 
 export interface PlayerState {
@@ -21,37 +21,52 @@ export interface PlayerState {
   melds: Meld[];
 }
 
-export type Phase = 'draw' | 'discard' | 'afterDiscard' | 'over';
+export type Phase = 'draw' | 'discard' | 'afterDiscard' | 'afterKakan' | 'over';
 
 export type GameResult =
   | { type: 'tsumo'; winner: Seat; hand: WinResult; scoreDelta: number[] }
   | { type: 'ron'; winner: Seat; from: Seat; hand: WinResult; scoreDelta: number[] }
   | { type: 'ryuukyoku'; tenpai: Seat[]; scoreDelta: number[] };
 
+/** 打牌に対して鳴ける席とその選択肢。 */
+export interface PendingCall {
+  seat: Seat;
+  ron: boolean;
+  pon: boolean;
+  minkan: boolean;
+  chi: [Tile, Tile][]; // 手牌から出す2枚の組（複数あり得る）
+}
+
 export interface GameState {
   rule: RuleConfig;
   rng: RngState;
-  wind: Wind; // 場風（東/南）
-  dealer: Seat; // 親の席
+  wind: Wind;
+  dealer: Seat;
   honba: number;
-  riichiSticks: number; // 供託リーチ棒の本数
-  wall: Tile[]; // 全136牌（シャッフル済み）
-  liveEnd: number; // 生牌の終端（exclusive）。これ以降は王牌
-  drawIndex: number; // 次にツモる生牌の位置
+  riichiSticks: number;
+  wall: Tile[];
+  liveEnd: number; // 生牌終端（カンごとに減る）
+  drawIndex: number;
   doraIndicators: Tile[];
   uraIndicators: Tile[];
-  hands: PlayerState[]; // 席0..3
+  kanCount: number;
+  rinshanDrawn: number; // 王牌から引いた嶺上牌の数
+  rinshan: boolean; // 直前のツモが嶺上か（嶺上開花用）
+  hands: PlayerState[];
   discards: Tile[][];
   riichi: boolean[];
   ippatsu: boolean[];
-  tempFuriten: boolean[]; // 同巡内フリテン（次の自分のツモで解除）
-  riichiFuriten: boolean[]; // リーチ後の見逃し（恒久フリテン）
+  tempFuriten: boolean[];
+  riichiFuriten: boolean[];
   scores: number[];
   turn: Seat;
   phase: Phase;
-  drawnTile: Tile | null; // 現在の手番のツモ牌
+  drawnTile: Tile | null;
   lastDiscard: { seat: Seat; tile: Tile } | null;
-  pendingRon: Seat[]; // 直前の打牌にロン可能な席
+  pendingCalls: PendingCall[]; // afterDiscard の鳴き候補
+  callResponses: Record<number, Action>; // 席 -> 応答
+  chankanTile: Tile | null; // 加槓のチャンカン待ち牌
+  kuikae: TileKind[]; // 現手番が喰い替えで打てない種（鳴き直後の1打のみ）
   result: GameResult | null;
 }
 
@@ -60,29 +75,37 @@ export type Action =
   | { type: 'discard'; tile: Tile; riichi?: boolean }
   | { type: 'tsumo' }
   | { type: 'ron'; seat: Seat }
+  | { type: 'pon'; seat: Seat }
+  | { type: 'chi'; seat: Seat; tiles: [Tile, Tile] }
+  | { type: 'kan'; seat: Seat; kind: 'minkan' | 'ankan' | 'kakan'; tile: TileKind }
   | { type: 'pass'; seat: Seat };
 
 export type GameEvent =
   | { type: 'illegal'; reason: string }
-  | { type: 'draw'; seat: Seat; tile: Tile }
+  | { type: 'draw'; seat: Seat; tile: Tile; rinshan: boolean }
   | { type: 'discard'; seat: Seat; tile: Tile; riichi: boolean }
-  | { type: 'ronWindow'; seats: Seat[] }
+  | { type: 'call'; seat: Seat; meld: Meld }
+  | { type: 'callWindow'; seats: Seat[] }
+  | { type: 'chankanWindow'; seats: Seat[] }
   | { type: 'result'; result: GameResult };
 
 const SEATS: Seat[] = [0, 1, 2, 3];
 const WINDS: Wind[] = ['E', 'S', 'W', 'N'];
 const nextSeat = (s: Seat): Seat => (((s + 1) % 4) as Seat);
+const distFrom = (from: Seat, s: Seat) => (s - from + 4) % 4;
 
-/** 席の自風（親=東）。 */
 export function seatWindOf(state: GameState, seat: Seat): Wind {
   return WINDS[(seat - state.dealer + 4) % 4];
+}
+
+function isMenzen(hand: PlayerState): boolean {
+  return hand.melds.every((m) => m.type === 'ankan');
 }
 
 function sortTiles(tiles: Tile[]): Tile[] {
   return [...tiles].sort((a, b) => a.kind - b.kind || Number(a.red) - Number(b.red) || a.id - b.id);
 }
 
-/** 136牌を生成（赤5は各色1枚まで akaCount に従う）。 */
 function buildWall(akaCount: number): Tile[] {
   const redKinds = [4, 13, 22].slice(0, Math.max(0, Math.min(akaCount, 3)));
   const tiles: Tile[] = [];
@@ -128,6 +151,9 @@ function dealHand(rng: RngState, p: DealParams): GameState {
     drawIndex: 52,
     doraIndicators: [deadWall[4]],
     uraIndicators: [deadWall[5]],
+    kanCount: 0,
+    rinshanDrawn: 0,
+    rinshan: false,
     hands,
     discards: [[], [], [], []],
     riichi: [false, false, false, false],
@@ -139,12 +165,14 @@ function dealHand(rng: RngState, p: DealParams): GameState {
     phase: 'draw',
     drawnTile: null,
     lastDiscard: null,
-    pendingRon: [],
+    pendingCalls: [],
+    callResponses: {},
+    chankanTile: null,
+    kuikae: [],
     result: null,
   };
 }
 
-/** 新規対局（東1局・親=席0・25000持ち）。 */
 export function createGame(seed: number, rule: RuleConfig = DEFAULT_RULE): GameState {
   return dealHand(makeRng(seed), {
     rule,
@@ -156,22 +184,41 @@ export function createGame(seed: number, rule: RuleConfig = DEFAULT_RULE): GameS
   });
 }
 
-function winInputFor(state: GameState, seat: Seat, winTile: TileKind, byTsumo: boolean): WinInput {
+function meldToCalled(m: Meld): CalledMeld {
+  if (m.type === 'chi') {
+    const lo = Math.min(...m.tiles.map((t) => t.kind));
+    return { type: 'chi', tile: lo };
+  }
+  return { type: m.type, tile: m.tiles[0].kind };
+}
+
+function winInputFor(
+  state: GameState,
+  seat: Seat,
+  winTile: TileKind,
+  winRedTile: boolean,
+  byTsumo: boolean,
+  chankan: boolean,
+): WinInput {
   const counts = tilesToCounts(state.hands[seat].concealed);
-  if (!byTsumo) counts[winTile]++; // ロンは和了牌を加える（ツモは既に手に含む）
+  if (!byTsumo) counts[winTile]++;
   const wallEmpty = state.drawIndex >= state.liveEnd;
   let red = state.hands[seat].concealed.filter((t) => t.red).length;
-  if (!byTsumo && state.lastDiscard?.tile.red) red++;
+  for (const m of state.hands[seat].melds) red += m.tiles.filter((t) => t.red).length;
+  if (!byTsumo && winRedTile) red++;
   return {
     concealed: counts,
+    called: state.hands[seat].melds.map(meldToCalled),
     winTile,
     byTsumo,
     seatWind: seatWindOf(state, seat),
     roundWind: state.wind,
     riichi: state.riichi[seat],
     ippatsu: state.ippatsu[seat],
+    rinshan: byTsumo && state.rinshan,
+    chankan,
     haitei: byTsumo && wallEmpty,
-    houtei: !byTsumo && wallEmpty,
+    houtei: !byTsumo && !chankan && wallEmpty,
     doraIndicators: state.doraIndicators.map((t) => t.kind),
     uraIndicators: state.uraIndicators.map((t) => t.kind),
     redCount: red,
@@ -182,18 +229,16 @@ function winInputFor(state: GameState, seat: Seat, winTile: TileKind, byTsumo: b
   };
 }
 
-function canRon(state: GameState, seat: Seat, winTile: TileKind): boolean {
+function canRon(state: GameState, seat: Seat, winTile: TileKind, winRed: boolean, chankan: boolean): boolean {
   const melds = state.hands[seat].melds.length;
   const base = tilesToCounts(state.hands[seat].concealed);
   base[winTile]++;
   if (!isWinningHand(base, melds)) return false;
   if (state.tempFuriten[seat] || state.riichiFuriten[seat]) return false;
-  // 河フリテン: 自分の待ちのいずれかが自分の河にある
   const myWaits = waits(tilesToCounts(state.hands[seat].concealed), melds);
   const discarded = new Set(state.discards[seat].map((t) => t.kind));
   if (myWaits.some((k) => discarded.has(k))) return false;
-  // 役なしはロン不可
-  return evaluateWin(winInputFor(state, seat, winTile, false)) !== null;
+  return evaluateWin(winInputFor(state, seat, winTile, winRed, false, chankan)) !== null;
 }
 
 function canTsumo(state: GameState, seat: Seat): boolean {
@@ -201,48 +246,113 @@ function canTsumo(state: GameState, seat: Seat): boolean {
   if (!isWinningHand(counts, state.hands[seat].melds.length)) return false;
   const drawn = state.drawnTile;
   if (!drawn) return false;
-  return evaluateWin(winInputFor(state, seat, drawn.kind, true)) !== null;
+  return evaluateWin(winInputFor(state, seat, drawn.kind, drawn.red, true, false)) !== null;
 }
 
-/** 打牌後に聴牌が保たれるか（リーチ可否判定用）。 */
 function tenpaiAfterDiscard(concealed: Tile[], discardId: number, melds: number): boolean {
   const rest = concealed.filter((t) => t.id !== discardId);
   return isTenpai(tilesToCounts(rest), melds);
 }
 
-/** その席が今打てる合法手。 */
+const findKind = (tiles: Tile[], kind: TileKind) => tiles.find((t) => t.kind === kind);
+
+/** チーで出せる手牌2枚の組を列挙（discard と順子を作る）。 */
+function chiPairs(concealed: Tile[], k: TileKind): [Tile, Tile][] {
+  if (k >= 27) return [];
+  const n = k % 9;
+  const out: [Tile, Tile][] = [];
+  const tryPair = (a: TileKind, b: TileKind) => {
+    const ta = findKind(concealed, a);
+    const tb = findKind(concealed, b);
+    if (ta && tb) out.push([ta, tb]);
+  };
+  if (n >= 2) tryPair(k - 2, k - 1);
+  if (n >= 1 && n <= 7) tryPair(k - 1, k + 1);
+  if (n <= 6) tryPair(k + 1, k + 2);
+  return out;
+}
+
+/** 喰い替えで打てない種（鳴いた牌＝genbutsu、チーは筋も）。 */
+function kuikaeForbidden(meld: Meld, called: Tile): TileKind[] {
+  const forbidden = [called.kind];
+  if (meld.type === 'chi') {
+    const lo = Math.min(...meld.tiles.map((t) => t.kind));
+    if (called.kind === lo && lo % 9 <= 5) forbidden.push(lo + 3);
+    else if (called.kind === lo + 2 && lo % 9 >= 1) forbidden.push(lo - 1);
+  }
+  return forbidden;
+}
+
 export function legalActions(state: GameState, seat: Seat): Action[] {
   if (state.phase === 'draw') {
     return seat === state.turn ? [{ type: 'draw' }] : [];
   }
+
   if (state.phase === 'discard') {
     if (seat !== state.turn) return [];
     const acts: Action[] = [];
-    if (canTsumo(state, seat)) acts.push({ type: 'tsumo' });
     const hand = state.hands[seat];
-    // リーチ後はツモ切りのみ（手牌交換不可。カンは Phase 4b）
+    if (canTsumo(state, seat)) acts.push({ type: 'tsumo' });
+
+    // 暗槓・加槓（リーチ中の暗槓は不可。加槓はポンが要るので menzen riichi では発生しない）
+    if (!state.riichi[seat]) {
+      const counts = tilesToCounts(hand.concealed);
+      const seenKan = new Set<TileKind>();
+      for (const t of hand.concealed) {
+        if (counts[t.kind] === 4 && !seenKan.has(t.kind)) {
+          seenKan.add(t.kind);
+          acts.push({ type: 'kan', seat, kind: 'ankan', tile: t.kind });
+        }
+      }
+      for (const m of hand.melds) {
+        if (m.type === 'pon' && counts[m.tiles[0].kind] >= 1) {
+          acts.push({ type: 'kan', seat, kind: 'kakan', tile: m.tiles[0].kind });
+        }
+      }
+    }
+
+    // 打牌
     if (state.riichi[seat]) {
       if (state.drawnTile) acts.push({ type: 'discard', tile: state.drawnTile });
       return acts;
     }
-    const menzen = hand.melds.length === 0;
-    const canRiichi =
-      menzen && !state.riichi[seat] && state.scores[seat] >= 1000 && state.drawIndex < state.liveEnd;
+    const menzen = isMenzen(hand);
+    const canRiichi = menzen && !state.riichi[seat] && state.scores[seat] >= 1000 && state.drawIndex < state.liveEnd;
+    const forbid = new Set(state.kuikae);
+    const discardActs: Action[] = [];
     const seen = new Set<TileKind>();
     for (const t of hand.concealed) {
       if (seen.has(t.kind)) continue;
       seen.add(t.kind);
-      acts.push({ type: 'discard', tile: t });
+      discardActs.push({ type: 'discard', tile: t });
       if (canRiichi && tenpaiAfterDiscard(hand.concealed, t.id, hand.melds.length)) {
-        acts.push({ type: 'discard', tile: t, riichi: true });
+        discardActs.push({ type: 'discard', tile: t, riichi: true });
       }
     }
+    // 喰い替え禁止牌を除外（全部禁止になるなら適用しない）
+    const filtered = discardActs.filter((a) => a.type === 'discard' && !forbid.has(a.tile.kind));
+    acts.push(...(filtered.length > 0 ? filtered : discardActs));
     return acts;
   }
+
   if (state.phase === 'afterDiscard') {
-    if (!state.pendingRon.includes(seat)) return [];
+    const pc = state.pendingCalls.find((p) => p.seat === seat);
+    if (!pc || state.callResponses[seat]) return [];
+    const acts: Action[] = [];
+    if (pc.ron) acts.push({ type: 'ron', seat });
+    if (pc.pon) acts.push({ type: 'pon', seat });
+    if (pc.minkan) acts.push({ type: 'kan', seat, kind: 'minkan', tile: state.lastDiscard!.tile.kind });
+    for (const pair of pc.chi) acts.push({ type: 'chi', seat, tiles: pair });
+    acts.push({ type: 'pass', seat });
+    return acts;
+  }
+
+  if (state.phase === 'afterKakan') {
+    const pc = state.pendingCalls.find((p) => p.seat === seat);
+    if (!pc || state.callResponses[seat]) return [];
     return [{ type: 'ron', seat }, { type: 'pass', seat }];
   }
+
   return [];
 }
 
@@ -250,7 +360,6 @@ function illegal(state: GameState, reason: string): { state: GameState; events: 
   return { state, events: [{ type: 'illegal', reason }] };
 }
 
-/** 流局（荒牌平局）。聴牌料を移動して終局。 */
 function ryuukyoku(s: GameState): { state: GameState; events: GameEvent[] } {
   const tenpai = SEATS.filter((seat) => isTenpai(tilesToCounts(s.hands[seat].concealed), s.hands[seat].melds.length));
   const delta = [0, 0, 0, 0];
@@ -278,52 +387,253 @@ function applyWinScore(s: GameState, res: WinResult, winner: Seat, byTsumo: bool
   } else if (!byTsumo && pay.type === 'ron' && from !== null) {
     delta[from] = -pay.from;
   }
-  delta[winner] = res.score.total; // 他家の支払い合計 + 供託（本場込み）
+  delta[winner] = res.score.total;
   for (const seat of SEATS) s.scores[seat] += delta[seat];
   s.riichiSticks = 0;
   return delta;
 }
 
-export function apply(state: GameState, action: Action): { state: GameState; events: GameEvent[] } {
-  if (state.phase === 'over') return illegal(state, '局は既に終了している');
+function winResult(s: GameState, winner: Seat, byTsumo: boolean, from: Seat | null, hand: WinResult): GameResult {
+  const delta = applyWinScore(s, hand, winner, byTsumo, from);
+  return byTsumo
+    ? { type: 'tsumo', winner, hand, scoreDelta: delta }
+    : { type: 'ron', winner, from: from!, hand, scoreDelta: delta };
+}
 
-  // --- draw ---
-  if (action.type === 'draw') {
-    if (state.phase !== 'draw') return illegal(state, 'ツモできる局面ではない');
-    if (state.drawIndex >= state.liveEnd) return ryuukyoku(clone(state)); // 山切れ→流局
-    const s = clone(state);
-    s.tempFuriten[s.turn] = false; // 同巡フリテン解除
-    const tile = s.wall[s.drawIndex++];
-    s.hands[s.turn].concealed = sortTiles([...s.hands[s.turn].concealed, tile]);
-    s.drawnTile = tile;
-    s.phase = 'discard';
-    return { state: s, events: [{ type: 'draw', seat: s.turn, tile }] };
+/** 王牌から嶺上牌を引き、カンドラを1枚めくる（s を破壊的に更新）。 */
+function drawRinshan(s: GameState, seat: Seat): Tile {
+  const deadWall = s.wall.slice(122);
+  const idx = s.doraIndicators.length; // 次に公開する指標(0=初期, 1..=カンドラ)
+  s.doraIndicators.push(deadWall[4 + 2 * idx]);
+  s.uraIndicators.push(deadWall[5 + 2 * idx]);
+  const tile = deadWall[s.rinshanDrawn];
+  s.rinshanDrawn += 1;
+  s.kanCount += 1;
+  s.liveEnd -= 1; // 生牌が1枚王牌へ補充される
+  s.hands[seat].concealed = sortTiles([...s.hands[seat].concealed, tile]);
+  s.drawnTile = tile;
+  s.rinshan = true;
+  return tile;
+}
+
+/** 打牌に対する鳴き候補を集める。 */
+function computePendingCalls(s: GameState, discard: Tile, discarder: Seat): PendingCall[] {
+  const out: PendingCall[] = [];
+  for (const seat of SEATS) {
+    if (seat === discarder) continue;
+    const counts = tilesToCounts(s.hands[seat].concealed);
+    const c = counts[discard.kind];
+    const ron = canRon(s, seat, discard.kind, discard.red, false);
+    const pon = c >= 2;
+    const minkan = c >= 3;
+    const chi = seat === nextSeat(discarder) ? chiPairs(s.hands[seat].concealed, discard.kind) : [];
+    if (ron || pon || minkan || chi.length > 0) out.push({ seat, ron, pon, minkan, chi });
+  }
+  return out;
+}
+
+/** 鳴き（ポン/チー/大明槓）を実行し、捨て牌を河から面子へ移す。 */
+function executeCall(s: GameState, action: Action): void {
+  const discard = s.lastDiscard!.tile;
+  const from = s.lastDiscard!.seat;
+  const seat = (action as { seat: Seat }).seat;
+  s.discards[from].pop(); // 河から取り上げる
+  const hand = s.hands[seat];
+  let meld: Meld;
+
+  if (action.type === 'pon' || (action.type === 'kan' && action.kind === 'minkan')) {
+    const need = action.type === 'pon' ? 2 : 3;
+    const taken: Tile[] = [];
+    // 赤を温存するため非赤から取る
+    for (const t of [...hand.concealed].sort((a, b) => Number(a.red) - Number(b.red))) {
+      if (t.kind === discard.kind && taken.length < need) taken.push(t);
+    }
+    hand.concealed = hand.concealed.filter((t) => !taken.includes(t));
+    meld = {
+      type: action.type === 'pon' ? 'pon' : 'minkan',
+      tiles: sortTiles([...taken, discard]),
+      from,
+    };
+  } else if (action.type === 'chi') {
+    const ids = new Set(action.tiles.map((t) => t.id));
+    hand.concealed = hand.concealed.filter((t) => !ids.has(t.id));
+    meld = { type: 'chi', tiles: sortTiles([...action.tiles, discard]), from };
+  } else {
+    throw new Error('executeCall: 不正な action');
   }
 
-  // --- tsumo ---
-  if (action.type === 'tsumo') {
-    if (state.phase !== 'discard') return illegal(state, 'ツモ和了できる局面ではない');
-    if (!canTsumo(state, state.turn)) return illegal(state, 'ツモ和了の条件を満たさない');
-    const s = clone(state);
-    const res = evaluateWin(winInputFor(s, s.turn, s.drawnTile!.kind, true))!;
-    const delta = applyWinScore(s, res, s.turn, true, null);
-    const result: GameResult = { type: 'tsumo', winner: s.turn, hand: res, scoreDelta: delta };
+  hand.melds.push(meld);
+  s.ippatsu = [false, false, false, false]; // 鳴きで全員の一発消滅
+  s.turn = seat;
+  s.drawnTile = null;
+  s.pendingCalls = [];
+  s.callResponses = {};
+  s.lastDiscard = null;
+
+  if (meld.type === 'minkan') {
+    drawRinshan(s, seat); // 大明槓は嶺上ツモ
+    s.kuikae = [];
+  } else {
+    s.rinshan = false;
+    s.kuikae = kuikaeForbidden(meld, discard);
+  }
+  s.phase = 'discard';
+}
+
+/** afterDiscard の応答が出揃ったら優先順位で解決する。 */
+function resolveCalls(s: GameState): { state: GameState; events: GameEvent[] } {
+  const responders = s.pendingCalls.map((p) => p.seat);
+  if (!responders.every((seat) => s.callResponses[seat])) {
+    return { state: s, events: [] }; // まだ待つ
+  }
+  const from = s.lastDiscard!.seat;
+  const discard = s.lastDiscard!.tile;
+
+  const rons = responders.filter((seat) => s.callResponses[seat].type === 'ron');
+  if (rons.length > 0) {
+    const winner = rons.sort((a, b) => distFrom(from, a) - distFrom(from, b))[0];
+    const res = evaluateWin(winInputFor(s, winner, discard.kind, discard.red, false, false))!;
+    const result = winResult(s, winner, false, from, res);
     s.result = result;
     s.phase = 'over';
     return { state: s, events: [{ type: 'result', result }] };
   }
 
-  // --- discard ---
+  const ponkan = responders.find(
+    (seat) => s.callResponses[seat].type === 'pon' || s.callResponses[seat].type === 'kan',
+  );
+  const chi = responders.find((seat) => s.callResponses[seat].type === 'chi');
+  const caller = ponkan ?? chi;
+  if (caller !== undefined) {
+    const meldType = s.callResponses[caller].type;
+    executeCall(s, s.callResponses[caller]);
+    const meld = s.hands[caller].melds[s.hands[caller].melds.length - 1];
+    const events: GameEvent[] = [{ type: 'call', seat: caller as Seat, meld }];
+    if (meldType === 'kan') {
+      events.push({ type: 'draw', seat: caller as Seat, tile: s.drawnTile!, rinshan: true });
+    }
+    return { state: s, events };
+  }
+
+  // 全員パス: ロン可能だった見逃しはフリテンに
+  for (const p of s.pendingCalls) {
+    if (p.ron) {
+      s.tempFuriten[p.seat] = true;
+      if (s.riichi[p.seat]) s.riichiFuriten[p.seat] = true;
+    }
+  }
+  s.turn = nextSeat(from);
+  s.phase = 'draw';
+  s.pendingCalls = [];
+  s.callResponses = {};
+  s.lastDiscard = null;
+  return { state: s, events: [] };
+}
+
+export function apply(state: GameState, action: Action): { state: GameState; events: GameEvent[] } {
+  if (state.phase === 'over') return illegal(state, '局は既に終了している');
+
+  // ===== draw =====
+  if (action.type === 'draw') {
+    if (state.phase !== 'draw') return illegal(state, 'ツモできる局面ではない');
+    if (state.drawIndex >= state.liveEnd) return ryuukyoku(clone(state));
+    const s = clone(state);
+    s.tempFuriten[s.turn] = false;
+    s.rinshan = false;
+    const tile = s.wall[s.drawIndex++];
+    s.hands[s.turn].concealed = sortTiles([...s.hands[s.turn].concealed, tile]);
+    s.drawnTile = tile;
+    s.kuikae = [];
+    s.phase = 'discard';
+    return { state: s, events: [{ type: 'draw', seat: s.turn, tile, rinshan: false }] };
+  }
+
+  // ===== tsumo =====
+  if (action.type === 'tsumo') {
+    if (state.phase !== 'discard') return illegal(state, 'ツモ和了できる局面ではない');
+    if (!canTsumo(state, state.turn)) return illegal(state, 'ツモ和了の条件を満たさない');
+    const s = clone(state);
+    const res = evaluateWin(winInputFor(s, s.turn, s.drawnTile!.kind, s.drawnTile!.red, true, false))!;
+    const result = winResult(s, s.turn, true, null, res);
+    s.result = result;
+    s.phase = 'over';
+    return { state: s, events: [{ type: 'result', result }] };
+  }
+
+  // ===== 暗槓 / 加槓（自分の手番）=====
+  if (action.type === 'kan' && (action.kind === 'ankan' || action.kind === 'kakan')) {
+    if (state.phase !== 'discard' || action.seat !== state.turn) return illegal(state, 'カンできる局面ではない');
+    const hand = state.hands[state.turn];
+    const counts = tilesToCounts(hand.concealed);
+
+    if (action.kind === 'ankan') {
+      if (state.riichi[state.turn]) return illegal(state, 'リーチ中の暗槓は不可(v1)');
+      if (counts[action.tile] !== 4) return illegal(state, '暗槓の条件を満たさない');
+      const s = clone(state);
+      const taken = s.hands[s.turn].concealed.filter((t) => t.kind === action.tile);
+      s.hands[s.turn].concealed = s.hands[s.turn].concealed.filter((t) => t.kind !== action.tile);
+      s.hands[s.turn].melds.push({ type: 'ankan', tiles: taken, from: null });
+      s.ippatsu = [false, false, false, false];
+      s.kuikae = [];
+      drawRinshan(s, s.turn);
+      return {
+        state: s,
+        events: [
+          { type: 'call', seat: s.turn, meld: s.hands[s.turn].melds[s.hands[s.turn].melds.length - 1] },
+          { type: 'draw', seat: s.turn, tile: s.drawnTile!, rinshan: true },
+        ],
+      };
+    }
+
+    // kakan: 既存ポンに4枚目を加える → 槍槓の窓を開く
+    const pon = hand.melds.find((m) => m.type === 'pon' && m.tiles[0].kind === action.tile);
+    if (!pon || counts[action.tile] < 1) return illegal(state, '加槓の条件を満たさない');
+    const s = clone(state);
+    const t4 = s.hands[s.turn].concealed.find((t) => t.kind === action.tile)!;
+    s.hands[s.turn].concealed = s.hands[s.turn].concealed.filter((t) => t.id !== t4.id);
+    const ponMeld = s.hands[s.turn].melds.find((m) => m.type === 'pon' && m.tiles[0].kind === action.tile)!;
+    ponMeld.type = 'kakan';
+    ponMeld.tiles = sortTiles([...ponMeld.tiles, t4]);
+    s.ippatsu = [false, false, false, false];
+    // 槍槓: 他家がこの牌でロンできるか
+    const pend: PendingCall[] = [];
+    for (const seat of SEATS) {
+      if (seat === s.turn) continue;
+      if (canRon(s, seat, action.tile, t4.red, true)) {
+        pend.push({ seat, ron: true, pon: false, minkan: false, chi: [] });
+      }
+    }
+    if (pend.length > 0) {
+      s.pendingCalls = pend;
+      s.callResponses = {};
+      s.chankanTile = t4;
+      s.phase = 'afterKakan';
+      return { state: s, events: [{ type: 'chankanWindow', seats: pend.map((p) => p.seat) }] };
+    }
+    drawRinshan(s, s.turn);
+    s.kuikae = [];
+    return {
+      state: s,
+      events: [
+        { type: 'call', seat: s.turn, meld: ponMeld },
+        { type: 'draw', seat: s.turn, tile: s.drawnTile!, rinshan: true },
+      ],
+    };
+  }
+
+  // ===== discard =====
   if (action.type === 'discard') {
     if (state.phase !== 'discard') return illegal(state, '打牌できる局面ではない');
     const turn = state.turn;
     const idx = state.hands[turn].concealed.findIndex((t) => t.id === action.tile.id);
     if (idx < 0) return illegal(state, '手牌にない牌は捨てられない');
+    if (state.kuikae.includes(action.tile.kind) && legalActions(state, turn).some((a) => a.type === 'discard' && !state.kuikae.includes(a.tile.kind))) {
+      return illegal(state, '喰い替えは禁止');
+    }
     const declareRiichi = action.riichi === true;
     if (declareRiichi) {
-      const menzen = state.hands[turn].melds.length === 0;
       const ok =
-        menzen &&
+        isMenzen(state.hands[turn]) &&
         !state.riichi[turn] &&
         state.scores[turn] >= 1000 &&
         state.drawIndex < state.liveEnd &&
@@ -334,6 +644,8 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
     const [tile] = s.hands[turn].concealed.splice(idx, 1);
     s.discards[turn].push(tile);
     s.drawnTile = null;
+    s.rinshan = false;
+    s.kuikae = [];
     s.lastDiscard = { seat: turn, tile };
     if (declareRiichi) {
       s.riichi[turn] = true;
@@ -341,60 +653,69 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
       s.scores[turn] -= 1000;
       s.riichiSticks += 1;
     } else {
-      s.ippatsu[turn] = false; // 自分の一発の窓を閉じる
+      s.ippatsu[turn] = false;
     }
-    // ロン可能な席を集める
-    s.pendingRon = SEATS.filter((seat) => seat !== turn && canRon(s, seat, tile.kind));
-    if (s.pendingRon.length > 0) {
+
+    s.pendingCalls = computePendingCalls(s, tile, turn);
+    s.callResponses = {};
+    const evDiscard: GameEvent = { type: 'discard', seat: turn, tile, riichi: declareRiichi };
+    if (s.pendingCalls.length > 0) {
       s.phase = 'afterDiscard';
-      return {
-        state: s,
-        events: [
-          { type: 'discard', seat: turn, tile, riichi: declareRiichi },
-          { type: 'ronWindow', seats: s.pendingRon },
-        ],
-      };
+      return { state: s, events: [evDiscard, { type: 'callWindow', seats: s.pendingCalls.map((p) => p.seat) }] };
     }
     s.turn = nextSeat(turn);
     s.phase = 'draw';
-    return { state: s, events: [{ type: 'discard', seat: turn, tile, riichi: declareRiichi }] };
+    return { state: s, events: [evDiscard] };
   }
 
-  // --- ron ---
-  if (action.type === 'ron') {
-    if (state.phase !== 'afterDiscard' || !state.pendingRon.includes(action.seat)) {
-      return illegal(state, 'ロンできる局面ではない');
-    }
+  // ===== afterDiscard の応答（ron/pon/chi/minkan/pass）=====
+  if (state.phase === 'afterDiscard') {
+    const valid = (action.type === 'ron' || action.type === 'pon' || action.type === 'chi' || action.type === 'kan' || action.type === 'pass');
+    const seat = (action as { seat?: Seat }).seat;
+    if (!valid || seat === undefined) return illegal(state, '鳴き局面で不正なアクション');
+    const allowed = legalActions(state, seat).some((a) => JSON.stringify(a) === JSON.stringify(action));
+    if (!allowed) return illegal(state, 'その鳴きは選べない');
     const s = clone(state);
-    const winTile = s.lastDiscard!.tile;
-    const res = evaluateWin(winInputFor(s, action.seat, winTile.kind, false))!;
-    const delta = applyWinScore(s, res, action.seat, false, s.lastDiscard!.seat);
-    const result: GameResult = {
-      type: 'ron',
-      winner: action.seat,
-      from: s.lastDiscard!.seat,
-      hand: res,
-      scoreDelta: delta,
-    };
-    s.result = result;
-    s.phase = 'over';
-    return { state: s, events: [{ type: 'result', result }] };
+    s.callResponses[seat] = action;
+    return resolveCalls(s);
   }
 
-  // --- pass（ロン見逃し）---
-  if (action.type === 'pass') {
-    if (state.phase !== 'afterDiscard' || !state.pendingRon.includes(action.seat)) {
-      return illegal(state, '見逃しできる局面ではない');
+  // ===== afterKakan の応答（チャンカン ron / pass）=====
+  if (state.phase === 'afterKakan') {
+    const seat = (action as { seat?: Seat }).seat;
+    if ((action.type !== 'ron' && action.type !== 'pass') || seat === undefined) {
+      return illegal(state, 'チャンカン局面で不正なアクション');
+    }
+    if (!state.pendingCalls.some((p) => p.seat === seat) || state.callResponses[seat]) {
+      return illegal(state, 'チャンカンできない');
     }
     const s = clone(state);
-    s.tempFuriten[action.seat] = true;
-    if (s.riichi[action.seat]) s.riichiFuriten[action.seat] = true;
-    s.pendingRon = s.pendingRon.filter((x) => x !== action.seat);
-    if (s.pendingRon.length === 0) {
-      s.turn = nextSeat(s.lastDiscard!.seat);
-      s.phase = 'draw';
+    s.callResponses[seat] = action;
+    const responders = s.pendingCalls.map((p) => p.seat);
+    if (!responders.every((x) => s.callResponses[x])) return { state: s, events: [] };
+
+    const rons = responders.filter((x) => s.callResponses[x].type === 'ron');
+    if (rons.length > 0) {
+      const from = s.turn;
+      const winner = rons.sort((a, b) => distFrom(from, a) - distFrom(from, b))[0];
+      const res = evaluateWin(winInputFor(s, winner, s.chankanTile!.kind, s.chankanTile!.red, false, true))!;
+      const result = winResult(s, winner, false, from, res);
+      s.result = result;
+      s.phase = 'over';
+      return { state: s, events: [{ type: 'result', result }] };
     }
-    return { state: s, events: [] };
+    // 全員パス → 加槓続行（嶺上ツモ）。見逃しフリテン
+    for (const p of s.pendingCalls) {
+      s.tempFuriten[p.seat] = true;
+      if (s.riichi[p.seat]) s.riichiFuriten[p.seat] = true;
+    }
+    s.pendingCalls = [];
+    s.callResponses = {};
+    s.chankanTile = null;
+    drawRinshan(s, s.turn);
+    s.kuikae = [];
+    s.phase = 'discard';
+    return { state: s, events: [{ type: 'draw', seat: s.turn, tile: s.drawnTile!, rinshan: true }] };
   }
 
   return illegal(state, '不明なアクション');
@@ -406,18 +727,15 @@ export interface RankEntry {
   rank: number;
 }
 
-/** 順位（点数降順、同点は起家=席0に近い順）。 */
 export function finalRanking(state: GameState): RankEntry[] {
-  const sorted = SEATS.map((seat) => ({ seat, score: state.scores[seat] }))
-    .sort((a, b) => b.score - a.score || a.seat - b.seat);
+  const sorted = SEATS.map((seat) => ({ seat, score: state.scores[seat] })).sort(
+    (a, b) => b.score - a.score || a.seat - b.seat,
+  );
   return sorted.map((e, i) => ({ ...e, rank: i + 1 }));
 }
 
-export type NextHand =
-  | { over: true; ranking: RankEntry[] }
-  | { over: false; state: GameState };
+export type NextHand = { over: true; ranking: RankEntry[] } | { over: false; state: GameState };
 
-/** 局終了後、次局を配る（連荘/親送り/本場/場風を確定）。終局なら順位を返す。 */
 export function startNextHand(state: GameState): NextHand {
   if (state.phase !== 'over' || !state.result) {
     throw new Error('startNextHand: 局がまだ終了していない');
@@ -426,20 +744,16 @@ export function startNextHand(state: GameState): NextHand {
   const dealerKeeps =
     res.type === 'ryuukyoku' ? res.tenpai.includes(state.dealer) : res.winner === state.dealer;
 
-  // トビ（誰かが0点未満）→ 終局
-  if (state.scores.some((v) => v < 0)) {
-    return { over: true, ranking: finalRanking(state) };
-  }
+  if (state.scores.some((v) => v < 0)) return { over: true, ranking: finalRanking(state) };
 
   let wind = state.wind;
   let dealer = state.dealer;
   let honba: number;
   if (dealerKeeps) {
-    honba = state.honba + 1; // 連荘
+    honba = state.honba + 1;
   } else {
-    honba = res.type === 'ryuukyoku' ? state.honba + 1 : 0; // 流局は親流れでも本場+1、和了は0
+    honba = res.type === 'ryuukyoku' ? state.honba + 1 : 0;
     if (dealer === 3) {
-      // 親が一周 → 場風が進む（東→南）。南4局終了なら終局。
       if (wind === 'E') {
         wind = 'S';
         dealer = 0;
@@ -457,7 +771,7 @@ export function startNextHand(state: GameState): NextHand {
     wind,
     dealer,
     honba,
-    riichiSticks: state.riichiSticks, // 供託は持ち越し
+    riichiSticks: state.riichiSticks,
   });
   return { over: false, state: next };
 }
