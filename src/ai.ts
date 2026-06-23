@@ -8,6 +8,7 @@
 import type { Seat, TileKind, Tile, Wind } from './types.js';
 import { tilesToCounts, isYaochu } from './tiles.js';
 import { waits, isTenpai } from './win.js';
+import { shanten } from './shanten.js';
 import { legalActions, seatWindOf, type GameState, type Action, type PlayerState } from './game.js';
 
 const WIND_KIND: Record<Wind, TileKind> = { E: 27, S: 28, W: 29, N: 30 };
@@ -138,13 +139,33 @@ export function chooseAction(state: GameState, seat: Seat): Action {
 
   // v1 では自分から暗槓/加槓はしない（kan アクションは無視）
   const hand = state.hands[seat];
+  const melds = hand.melds.length;
   const discards = acts.filter((a) => a.type === 'discard');
 
-  const riichiActs = discards.filter((a) => a.type === 'discard' && a.riichi);
-  if (riichiActs.length > 0) return bestByWaits(hand, riichiActs);
+  // 各打牌候補（種ごと）について、切った後の向聴数を求める
+  const seen = new Set<TileKind>();
+  const byTile: { act: Action; kind: TileKind; sh: number }[] = [];
+  for (const a of discards) {
+    if (a.type !== 'discard' || a.riichi || seen.has(a.tile.kind)) continue;
+    seen.add(a.tile.kind);
+    const rest = tilesToCounts(hand.concealed);
+    rest[a.tile.kind]--;
+    byTile.push({ act: a, kind: a.tile.kind, sh: shanten(rest, melds) });
+  }
+  if (byTile.length === 0) return discards[0]; // 念のため
 
-  const reaching = discards.filter((a) => a.type === 'discard' && waitsAfterDiscard(hand, a.tile) > 0);
-  if (reaching.length > 0) return bestByWaits(hand, reaching);
+  const minSh = Math.min(...byTile.map((b) => b.sh));
+  const bestActs = byTile.filter((b) => b.sh === minSh).map((b) => b.act);
 
-  return leastUseful(hand, discards);
+  if (minSh === 0) {
+    // 聴牌: リーチ可能なら宣言（受け入れ最大）、不可なら受け入れ最大で打牌
+    const riichiKinds = new Set(bestActs.map((a) => (a.type === 'discard' ? a.tile.kind : -1)));
+    const riichiActs = discards.filter(
+      (a) => a.type === 'discard' && a.riichi && riichiKinds.has(a.tile.kind),
+    );
+    if (riichiActs.length > 0) return bestByWaits(hand, riichiActs);
+    return bestByWaits(hand, bestActs);
+  }
+  // 向聴を縮める打牌の中で、最も孤立した牌を切る
+  return leastUseful(hand, bestActs);
 }

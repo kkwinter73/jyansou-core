@@ -72,3 +72,5 @@ export {
 } from './game.js';
 
 export { chooseAction } from './ai.js';
+
+export { shanten } from './shanten.js';

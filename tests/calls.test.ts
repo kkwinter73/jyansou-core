@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { parseHand } from '../src/tiles.js';
 import { createGame, apply, legalActions, type GameState, type Action, type Meld } from '../src/game.js';
 import { chooseAction } from '../src/ai.js';
+import { shanten } from '../src/shanten.js';
+import { tilesToCounts } from '../src/tiles.js';
 import type { Tile, TileKind, Seat } from '../src/types.js';
 
 let idc = 2000;
@@ -202,6 +204,37 @@ describe('CPUの鳴き思考', () => {
     const after = apply(s, { type: 'discard', tile: find(seat0, 8) }).state;
     expect(after.pendingCalls.find((p) => p.seat === 1)?.pon).toBe(true); // ポンは可能
     expect(chooseAction(after, 1).type).toBe('pass'); // でも見送る
+  });
+});
+
+describe('CPUの打牌（向聴最小化）', () => {
+  it('向聴数が最小になる牌を切る', () => {
+    const hand = tilesFromHand('234m567m678p234s9s1z'); // 14枚: 4面子+9s+1z（雀頭なし→聴牌到達可能）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      drawnTile: find(hand, 30), // 1z
+      hands: [{ concealed: hand, melds: [] }, ...structuredClone(createGame(1).hands).slice(1)],
+    });
+    const action = chooseAction(s, 0);
+    expect(action.type).toBe('discard');
+    if (action.type !== 'discard') return;
+
+    const afterChosen = tilesToCounts(hand);
+    afterChosen[action.tile.kind]--;
+    const chosenSh = shanten(afterChosen, 0);
+
+    let best = 99;
+    const full = tilesToCounts(hand);
+    for (let k = 0; k < 34; k++) {
+      if (full[k] > 0) {
+        const r = tilesToCounts(hand);
+        r[k]--;
+        best = Math.min(best, shanten(r, 0));
+      }
+    }
+    expect(chosenSh).toBe(best); // 最小向聴の打牌を選ぶ
+    expect(best).toBe(0); // この手は聴牌到達可能
   });
 });
 
