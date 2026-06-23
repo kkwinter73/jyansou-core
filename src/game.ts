@@ -1,8 +1,8 @@
 // 局進行（Phase 4a 鳴きなし + Phase 4b 鳴き）。設計: game-flow-design.md, ADR-0006/0007。
 // 状態は不変。遷移は apply(state, action) -> { state, events } の純粋関数。
 // 鳴き: チー/ポン/大明槓/暗槓/加槓。優先順位 ロン > ポン/カン > チー。嶺上ツモ・カンドラ・槍槓・喰い替え防止。
-// 途中流局: 九種九牌(宣言)・四風連打・四家立直。流し満貫。送り槓(待ち不変の暗槓)。
-// 未対応(v1): 四槓散了。
+// 途中流局: 九種九牌(宣言)・四風連打・四家立直・四槓散了。流し満貫。送り槓(待ち不変の暗槓)。
+// カンは1局4回まで（嶺上牌が尽きるため。5回目は不可）。
 import type { Tile, Seat, Wind, TileKind } from './types.js';
 import type { RngState } from './state.js';
 import { DEFAULT_RULE, type RuleConfig } from './rule.js';
@@ -28,7 +28,7 @@ export type GameResult =
   | { type: 'tsumo'; winner: Seat; hand: WinResult; scoreDelta: number[] }
   | { type: 'ron'; winner: Seat; from: Seat; hand: WinResult; scoreDelta: number[] }
   | { type: 'ryuukyoku'; tenpai: Seat[]; scoreDelta: number[]; nagashi?: Seat[] }
-  | { type: 'abortive'; reason: 'kyuushu' | 'suufon' | 'suucha'; scoreDelta: number[] };
+  | { type: 'abortive'; reason: 'kyuushu' | 'suufon' | 'suucha' | 'suukaikan'; scoreDelta: number[] };
 
 /** 打牌に対して鳴ける席とその選択肢。 */
 export interface PendingCall {
@@ -52,6 +52,7 @@ export interface GameState {
   doraIndicators: Tile[];
   uraIndicators: Tile[];
   kanCount: number;
+  kansBySeat: number[]; // 席別カン数（四槓散了の判定）
   rinshanDrawn: number; // 王牌から引いた嶺上牌の数
   rinshan: boolean; // 直前のツモが嶺上か（嶺上開花用）
   hands: PlayerState[];
@@ -156,6 +157,7 @@ function dealHand(rng: RngState, p: DealParams): GameState {
     doraIndicators: [deadWall[4]],
     uraIndicators: [deadWall[5]],
     kanCount: 0,
+    kansBySeat: [0, 0, 0, 0],
     rinshanDrawn: 0,
     rinshan: false,
     hands,
@@ -333,7 +335,7 @@ export function legalActions(state: GameState, seat: Seat): Action[] {
     if (canKyuushu(state, seat)) acts.push({ type: 'kyuushu', seat });
 
     const counts = tilesToCounts(hand.concealed);
-    if (!state.riichi[seat]) {
+    if (state.kanCount < 4 && !state.riichi[seat]) {
       // 暗槓・加槓
       const seenKan = new Set<TileKind>();
       for (const t of hand.concealed) {
@@ -347,7 +349,7 @@ export function legalActions(state: GameState, seat: Seat): Action[] {
           acts.push({ type: 'kan', seat, kind: 'kakan', tile: m.tiles[0].kind });
         }
       }
-    } else {
+    } else if (state.kanCount < 4 && state.riichi[seat]) {
       // リーチ中: 送り槓（待ち不変の暗槓）のみ
       const drawn = state.drawnTile;
       if (drawn && counts[drawn.kind] === 4 && canAnkanInRiichi(state, seat, drawn.kind)) {
@@ -442,6 +444,12 @@ function ryuukyoku(s: GameState): { state: GameState; events: GameEvent[] } {
 
 /** 途中流局（四風連打・四家立直）の判定。成立すれば result/phase を設定して true。 */
 function maybeAbort(s: GameState): boolean {
+  // 四槓散了: カン4回が複数人にまたがる（1人で4回＝四槓子狙いは続行）
+  if (s.kanCount >= 4 && s.kansBySeat.filter((n) => n > 0).length >= 2) {
+    s.result = { type: 'abortive', reason: 'suukaikan', scoreDelta: [0, 0, 0, 0] };
+    s.phase = 'over';
+    return true;
+  }
   const total = s.discards.reduce((n, d) => n + d.length, 0);
   const noMelds = s.hands.every((h) => h.melds.length === 0);
   // 四風連打: 最初の4打がすべて同じ風牌・鳴きなし
@@ -495,6 +503,7 @@ function drawRinshan(s: GameState, seat: Seat): Tile {
   const tile = deadWall[s.rinshanDrawn];
   s.rinshanDrawn += 1;
   s.kanCount += 1;
+  s.kansBySeat[seat] += 1;
   s.liveEnd -= 1; // 生牌が1枚王牌へ補充される
   s.hands[seat].concealed = sortTiles([...s.hands[seat].concealed, tile]);
   s.drawnTile = tile;
@@ -515,7 +524,7 @@ function computePendingCalls(s: GameState, discard: Tile, discarder: Seat): Pend
     }
     const c = tilesToCounts(s.hands[seat].concealed)[discard.kind];
     const pon = c >= 2;
-    const minkan = c >= 3;
+    const minkan = c >= 3 && s.kanCount < 4; // 嶺上牌が尽きる5回目のカンは不可
     const chi = seat === nextSeat(discarder) ? chiPairs(s.hands[seat].concealed, discard.kind) : [];
     if (ron || pon || minkan || chi.length > 0) out.push({ seat, ron, pon, minkan, chi });
   }
@@ -666,6 +675,7 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
   // ===== 暗槓 / 加槓（自分の手番）=====
   if (action.type === 'kan' && (action.kind === 'ankan' || action.kind === 'kakan')) {
     if (state.phase !== 'discard' || action.seat !== state.turn) return illegal(state, 'カンできる局面ではない');
+    if (state.kanCount >= 4) return illegal(state, 'カンは4回まで（嶺上牌が尽きる）');
     const hand = state.hands[state.turn];
     const counts = tilesToCounts(hand.concealed);
 

@@ -77,6 +77,56 @@ describe('流し満貫', () => {
   });
 });
 
+describe('四槓散了', () => {
+  const noten = (h: string) => ({ concealed: tilesFromHand(h), melds: [] });
+
+  it('4回目のカンが複数人にまたがると途中流局', () => {
+    const seat0 = tilesFromHand('1111m234p567p99s5p'); // 1m×4で暗槓可（13枚）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      kanCount: 3,
+      kansBySeat: [2, 1, 0, 0], // 既に席0が2回・席1が1回（＝複数人）
+      drawnTile: find(seat0, 13),
+      hands: [
+        { concealed: seat0, melds: [] },
+        noten('123m456m789m99p23z'),
+        noten('123m456m789m99p23z'),
+        noten('123m456m789m99p23z'),
+      ],
+    });
+    const afterKan = apply(s, { type: 'kan', seat: 0, kind: 'ankan', tile: 0 }).state;
+    expect(afterKan.kanCount).toBe(4);
+    const ninesou = find(afterKan.hands[0].concealed, 26); // 9s を捨てる（他家は鳴けない）
+    const { state } = apply(afterKan, { type: 'discard', tile: ninesou });
+    expect(state.result).toEqual({ type: 'abortive', reason: 'suukaikan', scoreDelta: [0, 0, 0, 0] });
+    expect(conserved(state)).toBe(100000);
+  });
+
+  it('1人で4つ（四槓子狙い）なら流局しない', () => {
+    const seat0 = tilesFromHand('1111m234p567p99s5p');
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      kanCount: 3,
+      kansBySeat: [3, 0, 0, 0], // すべて席0
+      drawnTile: find(seat0, 13),
+      hands: [
+        { concealed: seat0, melds: [] },
+        noten('123m456m789m99p23z'),
+        noten('123m456m789m99p23z'),
+        noten('123m456m789m99p23z'),
+      ],
+    });
+    const afterKan = apply(s, { type: 'kan', seat: 0, kind: 'ankan', tile: 0 }).state;
+    const ninesou = find(afterKan.hands[0].concealed, 26);
+    const { state } = apply(afterKan, { type: 'discard', tile: ninesou });
+    expect(state.result).toBeNull(); // 流局しない
+    expect(state.phase).toBe('draw');
+    expect(state.turn).toBe(1);
+  });
+});
+
 describe('送り槓（リーチ中の暗槓）', () => {
   it('待ちが変わらない暗槓は許可される', () => {
     const hand = tilesFromHand('2222m345m678p99s56s'); // 222mは固定の刻子、待ちは4s/7s
