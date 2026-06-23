@@ -1,12 +1,13 @@
 // 局進行（Phase 4a 鳴きなし + Phase 4b 鳴き）。設計: game-flow-design.md, ADR-0006/0007。
 // 状態は不変。遷移は apply(state, action) -> { state, events } の純粋関数。
 // 鳴き: チー/ポン/大明槓/暗槓/加槓。優先順位 ロン > ポン/カン > チー。嶺上ツモ・カンドラ・槍槓・喰い替え防止。
-// 制限(v1): リーチ中の暗槓は不可（送り槓の待ち不変判定を避け安全側に倒す）。途中流局・流し満貫は未対応。
+// 途中流局: 九種九牌(宣言)・四風連打・四家立直。流し満貫。送り槓(待ち不変の暗槓)。
+// 未対応(v1): 四槓散了。
 import type { Tile, Seat, Wind, TileKind } from './types.js';
 import type { RngState } from './state.js';
 import { DEFAULT_RULE, type RuleConfig } from './rule.js';
 import { makeRng, shuffle } from './rng.js';
-import { tilesToCounts } from './tiles.js';
+import { tilesToCounts, isYaochu } from './tiles.js';
 import { isWinningHand, isTenpai, waits } from './win.js';
 import { evaluateWin, type WinInput, type WinResult, type CalledMeld } from './yaku.js';
 
@@ -26,7 +27,8 @@ export type Phase = 'draw' | 'discard' | 'afterDiscard' | 'afterKakan' | 'over';
 export type GameResult =
   | { type: 'tsumo'; winner: Seat; hand: WinResult; scoreDelta: number[] }
   | { type: 'ron'; winner: Seat; from: Seat; hand: WinResult; scoreDelta: number[] }
-  | { type: 'ryuukyoku'; tenpai: Seat[]; scoreDelta: number[] };
+  | { type: 'ryuukyoku'; tenpai: Seat[]; scoreDelta: number[]; nagashi?: Seat[] }
+  | { type: 'abortive'; reason: 'kyuushu' | 'suufon' | 'suucha'; scoreDelta: number[] };
 
 /** 打牌に対して鳴ける席とその選択肢。 */
 export interface PendingCall {
@@ -58,6 +60,7 @@ export interface GameState {
   ippatsu: boolean[];
   tempFuriten: boolean[];
   riichiFuriten: boolean[];
+  discardCalledFrom: boolean[]; // この席の打牌が鳴かれたか（流し満貫の判定）
   scores: number[];
   turn: Seat;
   phase: Phase;
@@ -78,6 +81,7 @@ export type Action =
   | { type: 'pon'; seat: Seat }
   | { type: 'chi'; seat: Seat; tiles: [Tile, Tile] }
   | { type: 'kan'; seat: Seat; kind: 'minkan' | 'ankan' | 'kakan'; tile: TileKind }
+  | { type: 'kyuushu'; seat: Seat } // 九種九牌で途中流局を宣言
   | { type: 'pass'; seat: Seat };
 
 export type GameEvent =
@@ -160,6 +164,7 @@ function dealHand(rng: RngState, p: DealParams): GameState {
     ippatsu: [false, false, false, false],
     tempFuriten: [false, false, false, false],
     riichiFuriten: [false, false, false, false],
+    discardCalledFrom: [false, false, false, false],
     scores: [...p.scores],
     turn: p.dealer,
     phase: 'draw',
@@ -283,6 +288,38 @@ function kuikaeForbidden(meld: Meld, called: Tile): TileKind[] {
   return forbidden;
 }
 
+const WIND_KINDS: readonly TileKind[] = [27, 28, 29, 30];
+const sameSet = (a: TileKind[], b: TileKind[]) =>
+  a.length === b.length && [...a].sort((x, y) => x - y).join(',') === [...b].sort((x, y) => x - y).join(',');
+
+/** 九種九牌の宣言可否（自分の第1ツモ・誰も鳴いていない・么九9種以上）。 */
+function canKyuushu(state: GameState, seat: Seat): boolean {
+  if (state.phase !== 'discard' || seat !== state.turn || !state.drawnTile) return false;
+  if (state.hands.some((h) => h.melds.length > 0)) return false; // 誰かが鳴いていたら不可
+  if (state.discards[seat].length > 0) return false; // 第1ツモのみ
+  const counts = tilesToCounts(state.hands[seat].concealed);
+  let kinds = 0;
+  for (let k = 0; k < 34; k++) if (isYaochu(k) && counts[k] > 0) kinds++;
+  return kinds >= 9;
+}
+
+/** 送り槓: リーチ中の暗槓は「待ちが変わらない」場合のみ許可。 */
+function canAnkanInRiichi(state: GameState, seat: Seat, kind: TileKind): boolean {
+  const hand = state.hands[seat];
+  const drawn = state.drawnTile;
+  if (!drawn || drawn.kind !== kind) return false; // ツモ牌での暗槓のみ
+  const counts = tilesToCounts(hand.concealed);
+  if (counts[kind] !== 4) return false;
+  const melds = hand.melds.length;
+  const before = tilesToCounts(hand.concealed);
+  before[drawn.kind]--; // ツモ牌を除いた＝リーチ時の待ち形
+  const wBefore = waits(before, melds);
+  const after = tilesToCounts(hand.concealed);
+  after[kind] -= 4;
+  const wAfter = waits(after, melds + 1);
+  return sameSet(wBefore, wAfter);
+}
+
 export function legalActions(state: GameState, seat: Seat): Action[] {
   if (state.phase === 'draw') {
     return seat === state.turn ? [{ type: 'draw' }] : [];
@@ -293,10 +330,11 @@ export function legalActions(state: GameState, seat: Seat): Action[] {
     const acts: Action[] = [];
     const hand = state.hands[seat];
     if (canTsumo(state, seat)) acts.push({ type: 'tsumo' });
+    if (canKyuushu(state, seat)) acts.push({ type: 'kyuushu', seat });
 
-    // 暗槓・加槓（リーチ中の暗槓は不可。加槓はポンが要るので menzen riichi では発生しない）
+    const counts = tilesToCounts(hand.concealed);
     if (!state.riichi[seat]) {
-      const counts = tilesToCounts(hand.concealed);
+      // 暗槓・加槓
       const seenKan = new Set<TileKind>();
       for (const t of hand.concealed) {
         if (counts[t.kind] === 4 && !seenKan.has(t.kind)) {
@@ -308,6 +346,12 @@ export function legalActions(state: GameState, seat: Seat): Action[] {
         if (m.type === 'pon' && counts[m.tiles[0].kind] >= 1) {
           acts.push({ type: 'kan', seat, kind: 'kakan', tile: m.tiles[0].kind });
         }
+      }
+    } else {
+      // リーチ中: 送り槓（待ち不変の暗槓）のみ
+      const drawn = state.drawnTile;
+      if (drawn && counts[drawn.kind] === 4 && canAnkanInRiichi(state, seat, drawn.kind)) {
+        acts.push({ type: 'kan', seat, kind: 'ankan', tile: drawn.kind });
       }
     }
 
@@ -362,18 +406,60 @@ function illegal(state: GameState, reason: string): { state: GameState; events: 
 
 function ryuukyoku(s: GameState): { state: GameState; events: GameEvent[] } {
   const tenpai = SEATS.filter((seat) => isTenpai(tilesToCounts(s.hands[seat].concealed), s.hands[seat].melds.length));
+  // 流し満貫: 自分の捨て牌が全て么九 かつ 一度も鳴かれていない
+  const nagashi = SEATS.filter(
+    (seat) =>
+      !s.discardCalledFrom[seat] &&
+      s.discards[seat].length > 0 &&
+      s.discards[seat].every((t) => isYaochu(t.kind)),
+  );
   const delta = [0, 0, 0, 0];
-  const t = tenpai.length;
-  if (t !== 0 && t !== 4) {
-    const recv = 3000 / t;
-    const pay = 3000 / (4 - t);
-    for (const seat of SEATS) delta[seat] = tenpai.includes(seat) ? recv : -pay;
+  if (nagashi.length > 0) {
+    // 満貫ツモ相当（供託・本場は動かさない）。複数なら各自に支払い。
+    for (const w of nagashi) {
+      for (const seat of SEATS) {
+        if (seat === w) continue;
+        const pay = w === s.dealer ? 4000 : seat === s.dealer ? 4000 : 2000;
+        delta[seat] -= pay;
+        delta[w] += pay;
+      }
+    }
+  } else {
+    const t = tenpai.length;
+    if (t !== 0 && t !== 4) {
+      const recv = 3000 / t;
+      const pay = 3000 / (4 - t);
+      for (const seat of SEATS) delta[seat] = tenpai.includes(seat) ? recv : -pay;
+    }
   }
   for (const seat of SEATS) s.scores[seat] += delta[seat];
   const result: GameResult = { type: 'ryuukyoku', tenpai, scoreDelta: delta };
+  if (nagashi.length > 0) result.nagashi = nagashi;
   s.result = result;
   s.phase = 'over';
   return { state: s, events: [{ type: 'result', result }] };
+}
+
+/** 途中流局（四風連打・四家立直）の判定。成立すれば result/phase を設定して true。 */
+function maybeAbort(s: GameState): boolean {
+  const total = s.discards.reduce((n, d) => n + d.length, 0);
+  const noMelds = s.hands.every((h) => h.melds.length === 0);
+  // 四風連打: 最初の4打がすべて同じ風牌・鳴きなし
+  if (total === 4 && noMelds && s.discards.every((d) => d.length === 1)) {
+    const first = s.discards[0][0].kind;
+    if (WIND_KINDS.includes(first) && SEATS.every((seat) => s.discards[seat][0].kind === first)) {
+      s.result = { type: 'abortive', reason: 'suufon', scoreDelta: [0, 0, 0, 0] };
+      s.phase = 'over';
+      return true;
+    }
+  }
+  // 四家立直: 全員リーチ
+  if (s.riichi.every((r) => r)) {
+    s.result = { type: 'abortive', reason: 'suucha', scoreDelta: [0, 0, 0, 0] };
+    s.phase = 'over';
+    return true;
+  }
+  return false;
 }
 
 function applyWinScore(s: GameState, res: WinResult, winner: Seat, byTsumo: boolean, from: Seat | null): number[] {
@@ -442,6 +528,7 @@ function executeCall(s: GameState, action: Action): void {
   const from = s.lastDiscard!.seat;
   const seat = (action as { seat: Seat }).seat;
   s.discards[from].pop(); // 河から取り上げる
+  s.discardCalledFrom[from] = true; // 流し満貫の権利を失う
   const hand = s.hands[seat];
   let meld: Meld;
 
@@ -526,11 +613,12 @@ function resolveCalls(s: GameState): { state: GameState; events: GameEvent[] } {
       if (s.riichi[p.seat]) s.riichiFuriten[p.seat] = true;
     }
   }
-  s.turn = nextSeat(from);
-  s.phase = 'draw';
   s.pendingCalls = [];
   s.callResponses = {};
   s.lastDiscard = null;
+  if (maybeAbort(s)) return { state: s, events: [{ type: 'result', result: s.result! }] };
+  s.turn = nextSeat(from);
+  s.phase = 'draw';
   return { state: s, events: [] };
 }
 
@@ -564,6 +652,17 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
     return { state: s, events: [{ type: 'result', result }] };
   }
 
+  // ===== 九種九牌（途中流局の宣言）=====
+  if (action.type === 'kyuushu') {
+    if (action.seat !== state.turn || !canKyuushu(state, action.seat)) {
+      return illegal(state, '九種九牌を宣言できない');
+    }
+    const s = clone(state);
+    s.result = { type: 'abortive', reason: 'kyuushu', scoreDelta: [0, 0, 0, 0] };
+    s.phase = 'over';
+    return { state: s, events: [{ type: 'result', result: s.result }] };
+  }
+
   // ===== 暗槓 / 加槓（自分の手番）=====
   if (action.type === 'kan' && (action.kind === 'ankan' || action.kind === 'kakan')) {
     if (state.phase !== 'discard' || action.seat !== state.turn) return illegal(state, 'カンできる局面ではない');
@@ -571,8 +670,10 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
     const counts = tilesToCounts(hand.concealed);
 
     if (action.kind === 'ankan') {
-      if (state.riichi[state.turn]) return illegal(state, 'リーチ中の暗槓は不可(v1)');
       if (counts[action.tile] !== 4) return illegal(state, '暗槓の条件を満たさない');
+      if (state.riichi[state.turn] && !canAnkanInRiichi(state, state.turn, action.tile)) {
+        return illegal(state, '送り槓は不可（待ちが変わる）');
+      }
       const s = clone(state);
       const taken = s.hands[s.turn].concealed.filter((t) => t.kind === action.tile);
       s.hands[s.turn].concealed = s.hands[s.turn].concealed.filter((t) => t.kind !== action.tile);
@@ -667,6 +768,7 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
       s.phase = 'afterDiscard';
       return { state: s, events: [evDiscard, { type: 'callWindow', seats: s.pendingCalls.map((p) => p.seat) }] };
     }
+    if (maybeAbort(s)) return { state: s, events: [evDiscard, { type: 'result', result: s.result! }] };
     s.turn = nextSeat(turn);
     s.phase = 'draw';
     return { state: s, events: [evDiscard] };
@@ -746,7 +848,11 @@ export function startNextHand(state: GameState): NextHand {
   }
   const res = state.result;
   const dealerKeeps =
-    res.type === 'ryuukyoku' ? res.tenpai.includes(state.dealer) : res.winner === state.dealer;
+    res.type === 'abortive'
+      ? true // 途中流局は連荘
+      : res.type === 'ryuukyoku'
+        ? res.tenpai.includes(state.dealer)
+        : res.winner === state.dealer;
 
   if (state.scores.some((v) => v < 0)) return { over: true, ranking: finalRanking(state) };
 
