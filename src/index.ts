@@ -69,3 +69,5 @@ export {
   finalRanking,
   startNextHand,
 } from './game.js';
+
+export { chooseAction } from './ai.js';

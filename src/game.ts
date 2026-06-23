@@ -220,6 +220,11 @@ export function legalActions(state: GameState, seat: Seat): Action[] {
     const acts: Action[] = [];
     if (canTsumo(state, seat)) acts.push({ type: 'tsumo' });
     const hand = state.hands[seat];
+    // リーチ後はツモ切りのみ（手牌交換不可。カンは Phase 4b）
+    if (state.riichi[seat]) {
+      if (state.drawnTile) acts.push({ type: 'discard', tile: state.drawnTile });
+      return acts;
+    }
     const menzen = hand.melds.length === 0;
     const canRiichi =
       menzen && !state.riichi[seat] && state.scores[seat] >= 1000 && state.drawIndex < state.liveEnd;

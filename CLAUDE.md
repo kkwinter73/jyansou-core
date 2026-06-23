@@ -33,3 +33,5 @@ npm run typecheck # tsc --noEmit
 
 Phase 1: 牌・PRNG・**和了形判定・待ち列挙**（実装済み）→ Phase 2: **役判定**（実装済み。`evaluateWin`）→ Phase 3: **符・点数**（実装済み: `fu.ts`/`score.ts`）→ Phase 4a: **局進行・鳴きなし完全ループ**（実装済み: `game.ts`。`createGame`/`legalActions`/`apply`/`startNextHand`/`finalRanking`。配牌・ツモ・打牌・リーチ・ツモ/ロン・フリテン・一発・流局・点移動・連荘/親送り・順位）→ **Phase 4b（未実装）: 鳴き（チー/ポン/カン）・カンのドラ/嶺上・途中流局・流し満貫**。
 役・点数の取りこぼしは ADR ではなく `tests/` のテスト表で管理する。既定: 切り上げ満貫なし・数え役満あり（ADR-0004）。`apply` は不変・純粋（ADR-0006）。状態複製は `structuredClone`（globals.d.ts で型補完）。
+
+CPU は `ai.ts` の `chooseAction(state, seat)`（戦略であってルールでないため必須APIと分離。v1は簡易ヒューリスティック）。
