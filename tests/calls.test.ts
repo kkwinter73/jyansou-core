@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseHand } from '../src/tiles.js';
 import { createGame, apply, legalActions, type GameState, type Action, type Meld } from '../src/game.js';
+import { chooseAction } from '../src/ai.js';
 import type { Tile, TileKind, Seat } from '../src/types.js';
 
 let idc = 2000;
@@ -164,6 +165,43 @@ describe('加槓と槍槓', () => {
       expect(state.result.hand.yaku.map((y) => y.name)).toContain('槍槓');
     }
     expect(conserved(state)).toBe(100000);
+  });
+});
+
+describe('CPUの鳴き思考', () => {
+  it('役牌（白）はポンする', () => {
+    const seat0 = tilesFromHand('5z234m567m234p567p9s'); // 白を捨てる
+    const seat1 = tilesFromHand('55z147m147s258p9s9p'); // 白×2・ノーテン（席1）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      hands: [
+        { concealed: seat0, melds: [] },
+        { concealed: seat1, melds: [] },
+        { concealed: NONCALL_M(), melds: [] },
+        { concealed: NONCALL_S(), melds: [] },
+      ],
+    });
+    const after = apply(s, { type: 'discard', tile: find(seat0, 31) }).state;
+    expect(chooseAction(after, 1).type).toBe('pon');
+  });
+
+  it('役牌でもタンヤオでもない鳴きはパス（門前維持）', () => {
+    const seat0 = tilesFromHand('9m234m567m234p567p1s'); // 9mを捨てる
+    const seat1 = tilesFromHand('99m119p119s12345z'); // 9m×2だが么九だらけ（タンヤオ不可）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      hands: [
+        { concealed: seat0, melds: [] },
+        { concealed: seat1, melds: [] },
+        { concealed: NONCALL_M(), melds: [] },
+        { concealed: NONCALL_S(), melds: [] },
+      ],
+    });
+    const after = apply(s, { type: 'discard', tile: find(seat0, 8) }).state;
+    expect(after.pendingCalls.find((p) => p.seat === 1)?.pon).toBe(true); // ポンは可能
+    expect(chooseAction(after, 1).type).toBe('pass'); // でも見送る
   });
 });
 

@@ -34,4 +34,5 @@ npm run typecheck # tsc --noEmit
 Phase 1-3: 牌・PRNG・和了判定・役・符・点数（実装済み）→ Phase 4a: 局進行・鳴きなし完全ループ（実装済み）→ Phase 4b: **鳴き（チー/ポン/大明槓/暗槓/加槓）実装済み**（`game.ts`。`pendingCalls`/`callResponses` で優先順位 ロン>ポン/カン>チー を解決。嶺上ツモ・カンドラ・槍槓・喰い替え防止・開いた手の点数）→ 残り: 途中流局・流し満貫、リーチ中の暗槓（v1は不可）、CPUの鳴き思考（現状は鳴きを開始せずパス/ロンのみ）。
 役・点数の取りこぼしは ADR ではなく `tests/` のテスト表で管理する。既定: 切り上げ満貫なし・数え役満あり（ADR-0004）。`apply` は不変・純粋（ADR-0006）。状態複製は `structuredClone`（globals.d.ts で型補完）。
 
-CPU は `ai.ts` の `chooseAction(state, seat)`（戦略であってルールでないため必須APIと分離。v1は簡易ヒューリスティック）。
+CPU は `ai.ts` の `chooseAction(state, seat)`（戦略であってルールでないため必須APIと分離）。v1: 和了優先、役牌(三元/自風/場風)はポン/カン、タンヤオ志向で聴牌到達ならポン/チー、他は門前維持でパス。自分から暗槓/加槓はしない。
+注意: リーチ者はロン以外の鳴き不可（`computePendingCalls` で除外）。

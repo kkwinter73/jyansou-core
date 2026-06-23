@@ -421,9 +421,13 @@ function computePendingCalls(s: GameState, discard: Tile, discarder: Seat): Pend
   const out: PendingCall[] = [];
   for (const seat of SEATS) {
     if (seat === discarder) continue;
-    const counts = tilesToCounts(s.hands[seat].concealed);
-    const c = counts[discard.kind];
     const ron = canRon(s, seat, discard.kind, discard.red, false);
+    // リーチ者は手牌が固定されるため、ロン以外の鳴き（ポン/チー/カン）はできない
+    if (s.riichi[seat]) {
+      if (ron) out.push({ seat, ron: true, pon: false, minkan: false, chi: [] });
+      continue;
+    }
+    const c = tilesToCounts(s.hands[seat].concealed)[discard.kind];
     const pon = c >= 2;
     const minkan = c >= 3;
     const chi = seat === nextSeat(discarder) ? chiPairs(s.hands[seat].concealed, discard.kind) : [];
