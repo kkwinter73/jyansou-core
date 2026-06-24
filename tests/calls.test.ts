@@ -238,6 +238,48 @@ describe('CPUの打牌（向聴最小化）', () => {
   });
 });
 
+describe('CPUの押し引き（ベタオリ）', () => {
+  it('他家リーチ＆自分が非聴牌なら現物を切る', () => {
+    const seat0 = tilesFromHand('1z234m678m1p5p9p3s7s9s9m'); // バラバラ（非聴牌）、1zを持つ
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      riichi: [false, true, false, false], // 席1がリーチ
+      discards: [[], [T(27)], [], []], // 席1の河に 1z(東=27)（現物）
+      drawnTile: find(seat0, 8), // 9m
+      hands: [
+        { concealed: seat0, melds: [] },
+        ...structuredClone(createGame(1).hands).slice(1),
+      ],
+    });
+    const action = chooseAction(s, 0);
+    expect(action.type).toBe('discard');
+    if (action.type === 'discard') expect(action.tile.kind).toBe(27); // 1z(東) = 現物
+  });
+
+  it('自分が聴牌なら降りずに押す（聴牌を維持）', () => {
+    const seat0 = tilesFromHand('234m567m678p234s9s1z'); // 聴牌到達可能
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      riichi: [false, true, false, false],
+      discards: [[], [T(0)], [], []], // 1m が現物だが席0は1mを持たない
+      drawnTile: find(seat0, 30),
+      hands: [
+        { concealed: seat0, melds: [] },
+        ...structuredClone(createGame(1).hands).slice(1),
+      ],
+    });
+    const action = chooseAction(s, 0);
+    expect(action.type).toBe('discard');
+    if (action.type === 'discard') {
+      const rest = tilesToCounts(seat0);
+      rest[action.tile.kind]--;
+      expect(shanten(rest, 0)).toBe(0); // 押して聴牌を維持
+    }
+  });
+});
+
 describe('鳴きまくりボットの自己対戦', () => {
   function callerBot(s: GameState, seat: Seat): Action {
     const acts = legalActions(s, seat);

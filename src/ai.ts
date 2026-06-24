@@ -106,6 +106,31 @@ function tanyaoCall(state: GameState, seat: Seat, acts: Action[]): Action | null
   return null;
 }
 
+/**
+ * ベタオリ: リーチ者の現物（河にある牌）を最優先で切る。
+ * 全リーチ者に対する現物カバー数を最大化し、同点なら孤立牌を選ぶ。
+ * 安全牌が無ければ最も孤立した牌（ベストエフォート）。
+ */
+function safestDiscard(state: GameState, hand: PlayerState, discards: Action[], threats: Seat[]): Action {
+  const counts = tilesToCounts(hand.concealed);
+  let best: Action | null = null;
+  let bestSafe = -1;
+  let bestUse = Infinity;
+  const seen = new Set<TileKind>();
+  for (const a of discards) {
+    if (a.type !== 'discard' || a.riichi || seen.has(a.tile.kind)) continue;
+    seen.add(a.tile.kind);
+    const safe = threats.filter((o) => state.discards[o].some((t) => t.kind === a.tile.kind)).length;
+    const use = usefulness(counts, a.tile.kind);
+    if (safe > bestSafe || (safe === bestSafe && use < bestUse)) {
+      best = a;
+      bestSafe = safe;
+      bestUse = use;
+    }
+  }
+  return best ?? discards[0];
+}
+
 /** その席が打つべき手を1つ選ぶ（純粋関数）。合法手が無い席に対して呼んではならない。 */
 export function chooseAction(state: GameState, seat: Seat): Action {
   const acts = legalActions(state, seat);
@@ -156,6 +181,12 @@ export function chooseAction(state: GameState, seat: Seat): Action {
 
   const minSh = Math.min(...byTile.map((b) => b.sh));
   const bestActs = byTile.filter((b) => b.sh === minSh).map((b) => b.act);
+
+  // 押し引き: 他家リーチがあり自分が非聴牌なら降りる（現物優先）
+  const threats = ([0, 1, 2, 3] as Seat[]).filter((o) => o !== seat && state.riichi[o]);
+  if (threats.length > 0 && minSh >= 1 && !state.riichi[seat]) {
+    return safestDiscard(state, hand, discards, threats);
+  }
 
   if (minSh === 0) {
     // 聴牌: リーチ可能なら宣言（受け入れ最大）、不可なら受け入れ最大で打牌
