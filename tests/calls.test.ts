@@ -257,6 +257,36 @@ describe('CPUの押し引き（ベタオリ）', () => {
     if (action.type === 'discard') expect(action.tile.kind).toBe(27); // 1z(東) = 現物
   });
 
+  it('現物が無ければ筋を切る（4s現物なら1sは筋で安全）', () => {
+    const seat0 = tilesFromHand('1s5p234m678m9m1p9p3z5z9s'); // 1s/5p等、4sは持たない（非聴牌）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      riichi: [false, true, false, false],
+      discards: [[], [T(21)], [], []], // 席1の河に 4s（21）→ 1s/7s は筋
+      drawnTile: find(seat0, 3), // 4m（在牌）
+      hands: [{ concealed: seat0, melds: [] }, ...structuredClone(createGame(1).hands).slice(1)],
+    });
+    const action = chooseAction(s, 0);
+    expect(action.type).toBe('discard');
+    if (action.type === 'discard') expect(action.tile.kind).toBe(18); // 1s（4sの筋）
+  });
+
+  it('現物も筋も無ければ、ほぼ見えている字牌を切る', () => {
+    const seat0 = tilesFromHand('5z5p234m678m9m1p9p3z7s9s'); // 白(5z)を1枚持つ（非聴牌）
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      riichi: [false, true, false, false],
+      discards: [[], [], [T(31), T(31)], []], // 白が場に2枚 → 自分の1枚で残り1（安全寄り）
+      drawnTile: find(seat0, 13), // 5p（在牌）
+      hands: [{ concealed: seat0, melds: [] }, ...structuredClone(createGame(1).hands).slice(1)],
+    });
+    const action = chooseAction(s, 0);
+    expect(action.type).toBe('discard');
+    if (action.type === 'discard') expect(action.tile.kind).toBe(31); // 白（残り1枚で安全寄り）
+  });
+
   it('自分が聴牌なら降りずに押す（聴牌を維持）', () => {
     const seat0 = tilesFromHand('234m567m678p234s9s1z'); // 聴牌到達可能
     const s = craftedState({

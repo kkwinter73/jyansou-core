@@ -106,25 +106,60 @@ function tanyaoCall(state: GameState, seat: Seat, acts: Action[]): Action | null
   return null;
 }
 
+/** 見えている牌の枚数（自分の手牌+全副露+全河+ドラ表示）。壁/字牌残数の判定に使う。 */
+function visibleCounts(state: GameState, seat: Seat): number[] {
+  const v = new Array(34).fill(0);
+  const add = (ts: readonly { kind: TileKind }[]) => {
+    for (const t of ts) v[t.kind]++;
+  };
+  add(state.hands[seat].concealed);
+  for (const s of [0, 1, 2, 3] as Seat[]) for (const m of state.hands[s].melds) add(m.tiles);
+  for (const d of state.discards) add(d);
+  add(state.doraIndicators);
+  return v;
+}
+
+/** kind をある1人のリーチ者(河=threatRiver)に切る危険度。0=現物、大きいほど危険。 */
+function dangerVsThreat(kind: TileKind, threatRiver: Set<TileKind>, vis: number[]): number {
+  if (threatRiver.has(kind)) return 0; // 現物
+  if (kind >= 27) {
+    const unseen = 4 - vis[kind]; // 字牌は残り枚数が少ないほど安全（単騎/シャンポンのみ）
+    return unseen <= 1 ? 1 : unseen === 2 ? 3 : 6;
+  }
+  const suit = Math.floor(kind / 9) * 9;
+  const n = (kind % 9) + 1; // 1..9
+  let d = n === 1 || n === 9 ? 5 : n === 2 || n === 8 ? 7 : 9; // 中張ほど危険
+  const gen = (num: number) => num >= 1 && num <= 9 && threatRiver.has(suit + num - 1);
+  const lowSuji = n >= 4 && gen(n - 3); // 下側の両面を否定
+  const highSuji = n <= 6 && gen(n + 3); // 上側の両面を否定
+  if (n >= 4 && n <= 6) d -= lowSuji && highSuji ? 5 : lowSuji || highSuji ? 2 : 0;
+  else d -= lowSuji || highSuji ? 3 : 0; // 1-3/7-9 は片筋で大きく安全
+  const wall = (num: number) => num >= 1 && num <= 9 && vis[suit + num - 1] >= 4; // ノーチャンス
+  if (n >= 2 && wall(n - 1)) d -= 2;
+  if (n <= 8 && wall(n + 1)) d -= 2;
+  return Math.max(1, d);
+}
+
 /**
- * ベタオリ: リーチ者の現物（河にある牌）を最優先で切る。
- * 全リーチ者に対する現物カバー数を最大化し、同点なら孤立牌を選ぶ。
- * 安全牌が無ければ最も孤立した牌（ベストエフォート）。
+ * ベタオリ: リーチ者への危険度（現物/筋/壁/字牌残数）が最小の牌を切る。
+ * 複数リーチには最悪ケース（max）を最小化。同点なら孤立牌を選ぶ。
  */
-function safestDiscard(state: GameState, hand: PlayerState, discards: Action[], threats: Seat[]): Action {
+function safestDiscard(state: GameState, seat: Seat, hand: PlayerState, discards: Action[], threats: Seat[]): Action {
   const counts = tilesToCounts(hand.concealed);
+  const vis = visibleCounts(state, seat);
+  const rivers = threats.map((o) => new Set(state.discards[o].map((t) => t.kind)));
   let best: Action | null = null;
-  let bestSafe = -1;
+  let bestDanger = Infinity;
   let bestUse = Infinity;
   const seen = new Set<TileKind>();
   for (const a of discards) {
     if (a.type !== 'discard' || a.riichi || seen.has(a.tile.kind)) continue;
     seen.add(a.tile.kind);
-    const safe = threats.filter((o) => state.discards[o].some((t) => t.kind === a.tile.kind)).length;
+    const danger = Math.max(...rivers.map((r) => dangerVsThreat(a.tile.kind, r, vis)));
     const use = usefulness(counts, a.tile.kind);
-    if (safe > bestSafe || (safe === bestSafe && use < bestUse)) {
+    if (danger < bestDanger || (danger === bestDanger && use < bestUse)) {
       best = a;
-      bestSafe = safe;
+      bestDanger = danger;
       bestUse = use;
     }
   }
@@ -185,7 +220,7 @@ export function chooseAction(state: GameState, seat: Seat): Action {
   // 押し引き: 他家リーチがあり自分が非聴牌なら降りる（現物優先）
   const threats = ([0, 1, 2, 3] as Seat[]).filter((o) => o !== seat && state.riichi[o]);
   if (threats.length > 0 && minSh >= 1 && !state.riichi[seat]) {
-    return safestDiscard(state, hand, discards, threats);
+    return safestDiscard(state, seat, hand, discards, threats);
   }
 
   if (minSh === 0) {

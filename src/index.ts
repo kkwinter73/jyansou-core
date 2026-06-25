@@ -1,5 +1,5 @@
 // @jyansou/core 公開API。web/server はこの入口だけを使う（architecture.md の契約）。
-// Phase 1: 牌・PRNG・和了形判定。Phase 2+ で legalActions/apply/evaluateWin を追加。
+// 牌・PRNG・和了/役/符/点数・局進行（鳴き/リーチ/各種流局/流し満貫）・CPU・向聴数を提供。
 export type { Tile, TileKind, Suit, Seat, Wind, Counts } from './types.js';
 export { NUM_KINDS, TILES_PER_KIND } from './types.js';
 export type { RngState } from './state.js';
