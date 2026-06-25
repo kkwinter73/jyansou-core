@@ -104,7 +104,13 @@ export type GameEvent =
 const SEATS: Seat[] = [0, 1, 2, 3];
 const WINDS: Wind[] = ['E', 'S', 'W', 'N'];
 const nextSeat = (s: Seat): Seat => (((s + 1) % 4) as Seat);
+const nextWind = (w: Wind): Wind => WINDS[(WINDS.indexOf(w) + 1) % 4];
 const distFrom = (from: Seat, s: Seat) => (s - from + 4) % 4;
+
+/** オーラス（最終局）か。tonpuu=東4局・hanchan=南4局。 */
+function isOorasu(wind: Wind, dealer: Seat, rule: RuleConfig): boolean {
+  return dealer === 3 && wind === (rule.gameLength === 'tonpuu' ? 'E' : 'S');
+}
 
 export function seatWindOf(state: GameState, seat: Seat): Wind {
   return WINDS[(seat - state.dealer + 4) % 4];
@@ -960,6 +966,7 @@ export function startNextHand(state: GameState): NextHand {
     throw new Error('startNextHand: 局がまだ終了していない');
   }
   const res = state.result;
+  const rule = state.rule;
   const dealerKeeps =
     res.type === 'abortive'
       ? true // 途中流局は連荘
@@ -967,22 +974,38 @@ export function startNextHand(state: GameState): NextHand {
         ? res.tenpai.includes(state.dealer)
         : res.winner === state.dealer;
 
-  if (state.scores.some((v) => v < 0)) return { over: true, ranking: finalRanking(state) };
+  // トビ終了（閾値を下回った者が出たら即終局）。
+  if (rule.tobiThreshold !== null && state.scores.some((v) => v < rule.tobiThreshold!)) {
+    return { over: true, ranking: finalRanking(state) };
+  }
+
+  const oorasu = isOorasu(state.wind, state.dealer, rule);
+
+  // アガリやめ／テンパイやめ: オーラスで親が連荘条件を満たし（和了 or 親聴牌流局）、
+  // かつ親がトップなら終局。途中流局では適用しない。
+  if (
+    oorasu &&
+    dealerKeeps &&
+    rule.agariyame &&
+    res.type !== 'abortive' &&
+    finalRanking(state)[0].seat === state.dealer
+  ) {
+    return { over: true, ranking: finalRanking(state) };
+  }
 
   let wind = state.wind;
   let dealer = state.dealer;
   let honba: number;
   if (dealerKeeps) {
+    // 連荘。オーラスでトップでない/アガリやめ無効なら延長戦（同じ局位置で本場+1）。
     honba = state.honba + 1;
   } else {
     honba = res.type === 'ryuukyoku' ? state.honba + 1 : 0;
+    // オーラスで親が流れたら終局。
+    if (oorasu) return { over: true, ranking: finalRanking(state) };
     if (dealer === 3) {
-      if (wind === 'E') {
-        wind = 'S';
-        dealer = 0;
-      } else {
-        return { over: true, ranking: finalRanking(state) };
-      }
+      wind = nextWind(wind);
+      dealer = 0;
     } else {
       dealer = nextSeat(dealer);
     }

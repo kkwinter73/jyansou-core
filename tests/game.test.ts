@@ -9,6 +9,7 @@ import {
   type GameState,
   type Action,
 } from '../src/game.js';
+import { DEFAULT_RULE, type RuleConfig } from '../src/rule.js';
 import type { Tile, TileKind, Seat } from '../src/types.js';
 
 let idc = 1000; // createGame の id(0..135) と衝突しない範囲
@@ -237,5 +238,73 @@ describe('連荘・親送り・順位', () => {
     const r = finalRanking(s);
     expect(r.map((e) => e.seat)).toEqual([2, 0, 1, 3]); // 30000 > 25000(席0<席1) > 20000
     expect(r.map((e) => e.rank)).toEqual([1, 2, 3, 4]);
+  });
+});
+
+describe('対局形式（RuleConfig: gameLength / agariyame / tobiThreshold）', () => {
+  const withRule = (rule: Partial<RuleConfig>, extra: Partial<GameState> = {}): GameState =>
+    craftedState({ rule: { ...DEFAULT_RULE, ...rule }, phase: 'over', scores: [25000, 25000, 25000, 25000], ...extra });
+  const ron = (winner: Seat, from: Seat): GameState['result'] =>
+    ({ type: 'ron', winner, from, hand: {} as never, scoreDelta: [0, 0, 0, 0] });
+  const tsumo = (winner: Seat): GameState['result'] =>
+    ({ type: 'tsumo', winner, hand: {} as never, scoreDelta: [0, 0, 0, 0] });
+
+  it('東風戦: 東4局・子の和了で終局', () => {
+    const s = withRule({ gameLength: 'tonpuu' }, { wind: 'E', dealer: 3, result: ron(0, 3) });
+    expect(startNextHand(s).over).toBe(true);
+  });
+
+  it('東風戦: 東4局・親流れの荒牌平局でも終局', () => {
+    const s = withRule(
+      { gameLength: 'tonpuu' },
+      { wind: 'E', dealer: 3, result: { type: 'ryuukyoku', tenpai: [0], scoreDelta: [0, 0, 0, 0] } },
+    );
+    expect(startNextHand(s).over).toBe(true);
+  });
+
+  it('半荘: 東4局・親流れでは南入（終局しない）', () => {
+    const s = withRule({ gameLength: 'hanchan' }, { wind: 'E', dealer: 3, result: ron(0, 3) });
+    const n = startNextHand(s);
+    expect(n.over).toBe(false);
+    if (!n.over) {
+      expect(n.state.wind).toBe('S');
+      expect(n.state.dealer).toBe(0);
+    }
+  });
+
+  it('アガリやめ: 南4局・親がトップで和了したら終局', () => {
+    const s = withRule({ agariyame: true }, { wind: 'S', dealer: 3, result: tsumo(3), scores: [20000, 20000, 20000, 40000] });
+    expect(startNextHand(s).over).toBe(true);
+  });
+
+  it('アガリやめ無効: 南4局・親トップ和了でも延長戦（同局位置で本場+1）', () => {
+    const s = withRule({ agariyame: false }, { wind: 'S', dealer: 3, result: tsumo(3), scores: [20000, 20000, 20000, 40000] });
+    const n = startNextHand(s);
+    expect(n.over).toBe(false);
+    if (!n.over) {
+      expect(n.state.wind).toBe('S');
+      expect(n.state.dealer).toBe(3);
+      expect(n.state.honba).toBe(1);
+    }
+  });
+
+  it('アガリやめ: 親がトップでなければ和了しても延長戦（終局しない）', () => {
+    const s = withRule({ agariyame: true }, { wind: 'S', dealer: 3, result: tsumo(3), scores: [40000, 20000, 20000, 20000] });
+    expect(startNextHand(s).over).toBe(false);
+  });
+
+  it('トビ: 閾値0未満で終局（既定）', () => {
+    const s = withRule({}, { result: tsumo(0), scores: [60000, 50000, -1000, 16000] });
+    expect(startNextHand(s).over).toBe(true);
+  });
+
+  it('トビなし(null): マイナス点でも終局しない', () => {
+    const s = withRule({ tobiThreshold: null }, { wind: 'E', dealer: 0, result: tsumo(0), scores: [60000, 50000, -1000, 16000] });
+    expect(startNextHand(s).over).toBe(false);
+  });
+
+  it('トビ: 任意閾値（1000未満で終局）', () => {
+    const s = withRule({ tobiThreshold: 1000 }, { result: tsumo(0), scores: [60000, 50000, 500, 14500] });
+    expect(startNextHand(s).over).toBe(true);
   });
 });
