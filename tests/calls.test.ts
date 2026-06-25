@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseHand } from '../src/tiles.js';
 import { createGame, apply, legalActions, type GameState, type Action, type Meld } from '../src/game.js';
-import { chooseAction } from '../src/ai.js';
+import { chooseAction, shouldPush } from '../src/ai.js';
 import { shanten } from '../src/shanten.js';
 import { tilesToCounts } from '../src/tiles.js';
 import type { Tile, TileKind, Seat } from '../src/types.js';
@@ -307,6 +307,40 @@ describe('CPUの押し引き（ベタオリ）', () => {
       rest[action.tile.kind]--;
       expect(shanten(rest, 0)).toBe(0); // 押して聴牌を維持
     }
+  });
+});
+
+describe('shouldPush（押し引き判断）', () => {
+  // craftedState は dora表示=9s → ドラ=1s(kind18)。開いた手(ポン)で門前ボーナスを外す。
+  const openHand = (concealed: string) =>
+    [{ concealed: tilesFromHand(concealed), melds: [{ type: 'pon' as const, tiles: [T(20), T(20), T(20)], from: 1 as const }] }];
+
+  it('聴牌(0向聴)は常に押す', () => {
+    const s = craftedState({ hands: [openHand('234m')[0], ...structuredClone(createGame(1).hands).slice(1)] });
+    expect(shouldPush(s, 0, 0)).toBe(true);
+  });
+  it('2向聴以上は降りる', () => {
+    const s = craftedState({ hands: [openHand('11s234m')[0], ...structuredClone(createGame(1).hands).slice(1)] });
+    expect(shouldPush(s, 0, 2)).toBe(false);
+  });
+  it('1向聴: 価値が高ければ押す（ドラ2）', () => {
+    const s = craftedState({ hands: [openHand('11s234m')[0], ...structuredClone(createGame(1).hands).slice(1)] }); // 1s×2=ドラ2
+    expect(shouldPush(s, 0, 1)).toBe(true);
+  });
+  it('1向聴: 安手なら降りる（ドラ0）', () => {
+    const s = craftedState({ hands: [openHand('234m')[0], ...structuredClone(createGame(1).hands).slice(1)] });
+    expect(shouldPush(s, 0, 1)).toBe(false);
+  });
+  it('1向聴: 価値があっても終盤(残り<6)は降りる', () => {
+    const s = craftedState({ drawIndex: 118, hands: [openHand('11s234m')[0], ...structuredClone(createGame(1).hands).slice(1)] });
+    expect(shouldPush(s, 0, 1)).toBe(false);
+  });
+  it('1向聴: 大きくリード時はより慎重（ドラ2でも降りる）', () => {
+    const s = craftedState({
+      scores: [50000, 17000, 17000, 16000], // lead > 12000
+      hands: [openHand('11s234m')[0], ...structuredClone(createGame(1).hands).slice(1)],
+    });
+    expect(shouldPush(s, 0, 1)).toBe(false); // need=3 だがドラ2しかない
   });
 });
 

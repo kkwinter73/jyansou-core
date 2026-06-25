@@ -140,6 +140,43 @@ function dangerVsThreat(kind: TileKind, threatRiver: Set<TileKind>, vis: number[
   return Math.max(1, d);
 }
 
+function doraKindOf(ind: TileKind): TileKind {
+  if (ind < 27) {
+    const s = Math.floor(ind / 9);
+    return s * 9 + ((ind % 9) + 1) % 9;
+  }
+  if (ind < 31) return 27 + ((ind - 27 + 1) % 4);
+  return 31 + ((ind - 31 + 1) % 3);
+}
+
+/** 手の価値（おおまかな打点期待）。ドラ＋赤＋門前ボーナス。 */
+function handValue(state: GameState, hand: PlayerState): number {
+  const tiles = [...hand.concealed, ...hand.melds.flatMap((m) => m.tiles)];
+  let v = 0;
+  for (const ind of state.doraIndicators) {
+    const d = doraKindOf(ind.kind);
+    v += tiles.filter((t) => t.kind === d).length;
+  }
+  v += tiles.filter((t) => t.red).length;
+  if (hand.melds.every((m) => m.type === 'ankan')) v += 1; // 門前（リーチ/裏期待）
+  return v;
+}
+
+/**
+ * 押すか降りるかの判断（他家リーチがある前提で呼ぶ）。
+ * 聴牌は押す／2向聴以上は降りる／1向聴は「手の価値・残り巡目・点棒リード」で判断。
+ */
+export function shouldPush(state: GameState, seat: Seat, minShanten: number): boolean {
+  if (minShanten <= 0) return true; // 聴牌は押す
+  if (minShanten >= 2) return false; // 2向聴以上は降りる
+  const wallLeft = state.liveEnd - state.drawIndex;
+  if (wallLeft < 6) return false; // 終盤の1向聴は降りる
+  const others = ([0, 1, 2, 3] as Seat[]).filter((s) => s !== seat).map((s) => state.scores[s]);
+  const lead = state.scores[seat] - Math.max(...others);
+  const need = lead > 12000 ? 3 : 2; // 大きくリード時は慎重（高い手しか押さない）
+  return handValue(state, state.hands[seat]) >= need;
+}
+
 /**
  * ベタオリ: リーチ者への危険度（現物/筋/壁/字牌残数）が最小の牌を切る。
  * 複数リーチには最悪ケース（max）を最小化。同点なら孤立牌を選ぶ。
@@ -217,9 +254,9 @@ export function chooseAction(state: GameState, seat: Seat): Action {
   const minSh = Math.min(...byTile.map((b) => b.sh));
   const bestActs = byTile.filter((b) => b.sh === minSh).map((b) => b.act);
 
-  // 押し引き: 他家リーチがあり自分が非聴牌なら降りる（現物優先）
+  // 押し引き: 他家リーチがあり、押す価値が無ければ降りる（手の価値・巡目・点棒で判断）
   const threats = ([0, 1, 2, 3] as Seat[]).filter((o) => o !== seat && state.riichi[o]);
-  if (threats.length > 0 && minSh >= 1 && !state.riichi[seat]) {
+  if (threats.length > 0 && !state.riichi[seat] && !shouldPush(state, seat, minSh)) {
     return safestDiscard(state, seat, hand, discards, threats);
   }
 

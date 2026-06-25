@@ -129,3 +129,40 @@ describe('鳴き手', () => {
     expect(r!.menzen).toBe(false);
   });
 });
+
+describe('役満エッジケース', () => {
+  it('四暗刻単騎（ダブル役満）', () => {
+    const r = evalHand('111m333m555m777p99s', '9s', { byTsumo: true });
+    expect(ymNames(r)).toContain('四暗刻単騎');
+    expect(r!.yakumanTotal).toBe(2);
+  });
+
+  it('大四喜（ダブル役満。四暗刻と複合）', () => {
+    const r = evalHand('111z222z333z444z55m', '4z', { byTsumo: true });
+    expect(ymNames(r)).toContain('大四喜');
+    expect(r!.yakumanTotal).toBeGreaterThanOrEqual(2); // 大四喜(2)＋四暗刻(1)
+  });
+
+  it('小四喜（役満）', () => {
+    // 東南西の刻子 + 北の雀頭 + 1面子
+    const r = evalHand('111z222z333z44z234m', '4z');
+    expect(ymNames(r)).toContain('小四喜');
+  });
+
+  it('字一色 + 大三元（役満の重複）', () => {
+    const r = evalHand('555z666z777z111z22z', '2z');
+    expect(ymNames(r)).toEqual(expect.arrayContaining(['大三元', '字一色']));
+    expect(r!.yakumanTotal).toBeGreaterThanOrEqual(2); // 大三元+字一色(+四暗刻単騎)
+  });
+
+  it('緑一色', () => {
+    const r = evalHand('234234s666888s66z', '4s');
+    expect(ymNames(r)).toContain('緑一色');
+  });
+
+  it('清老頭', () => {
+    const r = evalHand('111m999m111p999p11s', '1s');
+    expect(ymNames(r)).toContain('清老頭');
+  });
+
+})
