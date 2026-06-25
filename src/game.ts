@@ -742,6 +742,10 @@ export function apply(state: GameState, action: Action): { state: GameState; eve
     const turn = state.turn;
     const idx = state.hands[turn].concealed.findIndex((t) => t.id === action.tile.id);
     if (idx < 0) return illegal(state, '手牌にない牌は捨てられない');
+    // リーチ後はツモ切りのみ（手牌交換不可。送り槓のみ別途許可）
+    if (state.riichi[turn] && action.tile.id !== state.drawnTile?.id) {
+      return illegal(state, 'リーチ後はツモ切りのみ');
+    }
     if (state.kuikae.includes(action.tile.kind) && legalActions(state, turn).some((a) => a.type === 'discard' && !state.kuikae.includes(a.tile.kind))) {
       return illegal(state, '喰い替えは禁止');
     }

@@ -142,6 +142,31 @@ describe('ロンとフリテン', () => {
   });
 });
 
+describe('リーチ後はツモ切りのみ', () => {
+  it('リーチ中に手牌(ツモ牌以外)を切ろうとしても拒否される', () => {
+    const hand = tilesFromHand('234567m234567p55s'); // 13枚相当のテンパイ手 + ツモ
+    const drawn = T(33); // ツモ牌=中（手牌に無い独立牌）
+    const concealed = [...hand.slice(0, 13), drawn]; // 13 + ツモ = 14
+    const s = craftedState({
+      turn: 0,
+      phase: 'discard',
+      riichi: [true, false, false, false],
+      drawnTile: drawn,
+      hands: [{ concealed, melds: [] }, ...structuredClone(createGame(1).hands).slice(1)],
+    });
+    // ツモ牌以外（手牌の牌）を切る → 拒否（状態不変）
+    const handTile = concealed[0];
+    const bad = apply(s, { type: 'discard', tile: handTile });
+    expect(bad.events.some((e) => e.type === 'illegal')).toBe(true);
+    expect(bad.state).toBe(s); // 状態は変わらない
+
+    // ツモ牌（中）を切る → 通る（ツモ切り）
+    const ok = apply(s, { type: 'discard', tile: drawn });
+    expect(ok.events.some((e) => e.type === 'illegal')).toBe(false);
+    expect(ok.state.discards[0].some((t) => t.id === drawn.id)).toBe(true);
+  });
+});
+
 describe('流局', () => {
   it('聴牌1人・ノーテン3人 = 3000/−1000', () => {
     const tenpai = tilesFromHand('234567m234567p5s'); // 13枚・5s単騎
