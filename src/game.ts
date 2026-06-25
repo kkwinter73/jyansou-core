@@ -30,6 +30,12 @@ export type GameResult =
   | { type: 'ryuukyoku'; tenpai: Seat[]; scoreDelta: number[]; nagashi?: Seat[] }
   | { type: 'abortive'; reason: 'kyuushu' | 'suufon' | 'suucha' | 'suukaikan'; scoreDelta: number[] };
 
+/** 包（責任払い）。確定鳴きで役満を確定させた放出者の責任。 */
+export interface PaoLiability {
+  by: Seat; // 責任者（確定牌を放出した席）
+  yakuman: '大三元' | '大四喜'; // 責任の対象役満（yaku.ts の名称に一致）
+}
+
 /** 打牌に対して鳴ける席とその選択肢。 */
 export interface PendingCall {
   seat: Seat;
@@ -71,6 +77,7 @@ export interface GameState {
   callResponses: Record<number, Action>; // 席 -> 応答
   chankanTile: Tile | null; // 加槓のチャンカン待ち牌
   kuikae: TileKind[]; // 現手番が喰い替えで打てない種（鳴き直後の1打のみ）
+  pao: (PaoLiability | null)[]; // 席別の包（責任払い）。確定鳴きで設定（null=なし）
   result: GameResult | null;
 }
 
@@ -105,6 +112,27 @@ export function seatWindOf(state: GameState, seat: Seat): Wind {
 
 function isMenzen(hand: PlayerState): boolean {
   return hand.melds.every((m) => m.type === 'ankan');
+}
+
+const PAO_DRAGONS: TileKind[] = [31, 32, 33];
+const PAO_WINDS: TileKind[] = [27, 28, 29, 30];
+
+/** seat が kind の刻子/槓子を（手牌の暗刻 or 副露で）持っているか。 */
+function hasTripletOf(hand: PlayerState, kind: TileKind): boolean {
+  if (hand.melds.some((m) => m.type !== 'chi' && m.tiles[0].kind === kind)) return true;
+  return tilesToCounts(hand.concealed)[kind] >= 3;
+}
+
+/**
+ * 直前にポン/大明槓した meld が役満（大三元/大四喜）を確定させたか判定。
+ * 確定なら対象役満名を返す（残り種がすべて刻子で揃った瞬間のみ）。
+ */
+function paoCompletedBy(hand: PlayerState, meld: Meld): PaoLiability['yakuman'] | null {
+  if (meld.type !== 'pon' && meld.type !== 'minkan') return null;
+  const k = meld.tiles[0].kind;
+  if (PAO_DRAGONS.includes(k) && PAO_DRAGONS.every((d) => hasTripletOf(hand, d))) return '大三元';
+  if (PAO_WINDS.includes(k) && PAO_WINDS.every((w) => hasTripletOf(hand, w))) return '大四喜';
+  return null;
 }
 
 function sortTiles(tiles: Tile[]): Tile[] {
@@ -176,6 +204,7 @@ function dealHand(rng: RngState, p: DealParams): GameState {
     callResponses: {},
     chankanTile: null,
     kuikae: [],
+    pao: [null, null, null, null],
     result: null,
   };
 }
@@ -470,18 +499,85 @@ function maybeAbort(s: GameState): boolean {
   return false;
 }
 
-function applyWinScore(s: GameState, res: WinResult, winner: Seat, byTsumo: boolean, from: Seat | null): number[] {
+const ceil100 = (x: number) => Math.ceil(x / 100) * 100;
+
+/**
+ * 包（責任払い）の点移動。役満を pao 分（責任者負担）と free 分（通常分配）に分ける。
+ * - ツモ: pao 分は責任者が全額（3家分）を負担。free 分は通常のツモ分配。本場は通常通り各非和了者。
+ * - ロン: pao 分は責任者と放銃者で折半（同一席なら全額）。free 分は放銃者が全額。本場は放銃者。
+ * 供託リーチ棒は和了者へ。
+ */
+function paoScoreDelta(
+  s: GameState,
+  winner: Seat,
+  byTsumo: boolean,
+  from: Seat | null,
+  paoBy: Seat,
+  paoMult: number,
+  freeMult: number,
+): number[] {
+  const isDealer = winner === s.dealer;
+  const honba = s.honba;
   const delta = [0, 0, 0, 0];
-  const pay = res.score.payments;
-  if (byTsumo && pay.type === 'tsumo') {
+  const paoBase = 8000 * paoMult;
+  const freeBase = 8000 * freeMult;
+
+  if (byTsumo) {
     for (const seat of SEATS) {
       if (seat === winner) continue;
-      delta[seat] = -(seat === s.dealer && pay.fromDealer !== null ? pay.fromDealer : pay.fromEachNonDealer);
+      let pay = 100 * honba; // 本場は通常分配
+      if (freeBase > 0) pay += ceil100(freeBase * (isDealer || seat === s.dealer ? 2 : 1));
+      delta[seat] -= pay;
     }
-  } else if (!byTsumo && pay.type === 'ron' && from !== null) {
-    delta[from] = -pay.from;
+    if (paoBase > 0) {
+      const paoTotal = isDealer
+        ? 3 * ceil100(paoBase * 2)
+        : ceil100(paoBase * 2) + 2 * ceil100(paoBase * 1);
+      delta[paoBy] -= paoTotal;
+    }
+  } else if (from !== null) {
+    let discarderPay = 300 * honba; // 本場は放銃者
+    if (freeBase > 0) discarderPay += ceil100(freeBase * (isDealer ? 6 : 4));
+    delta[from] -= discarderPay;
+    if (paoBase > 0) {
+      const full = ceil100(paoBase * (isDealer ? 6 : 4));
+      if (paoBy === from) {
+        delta[from] -= full;
+      } else {
+        const half = ceil100(full / 2);
+        delta[paoBy] -= half;
+        delta[from] -= full - half;
+      }
+    }
   }
-  delta[winner] = res.score.total;
+
+  const paid = -delta.reduce((a, b) => a + b, 0); // 非和了者の支払い合計
+  delta[winner] = paid + s.riichiSticks * 1000;
+  return delta;
+}
+
+function applyWinScore(s: GameState, res: WinResult, winner: Seat, byTsumo: boolean, from: Seat | null): number[] {
+  const pao = s.pao[winner];
+  // 包は和了役満に対象が含まれるときのみ発動（手変わりで対象役満が消えた場合は通常分配）。
+  const paoMult = pao ? (res.yakuman.find((y) => y.name === pao.yakuman)?.han ?? 0) : 0;
+
+  let delta: number[];
+  if (pao && paoMult > 0) {
+    delta = paoScoreDelta(s, winner, byTsumo, from, pao.by, paoMult, res.yakumanTotal - paoMult);
+  } else {
+    delta = [0, 0, 0, 0];
+    const pay = res.score.payments;
+    if (byTsumo && pay.type === 'tsumo') {
+      for (const seat of SEATS) {
+        if (seat === winner) continue;
+        delta[seat] = -(seat === s.dealer && pay.fromDealer !== null ? pay.fromDealer : pay.fromEachNonDealer);
+      }
+    } else if (!byTsumo && pay.type === 'ron' && from !== null) {
+      delta[from] = -pay.from;
+    }
+    delta[winner] = res.score.total;
+  }
+
   for (const seat of SEATS) s.scores[seat] += delta[seat];
   s.riichiSticks = 0;
   return delta;
@@ -563,6 +659,9 @@ function executeCall(s: GameState, action: Action): void {
   }
 
   hand.melds.push(meld);
+  // 包（責任払い）: 確定鳴きで大三元/大四喜を確定させた放出者を責任者に記録（game-flow-design.md）。
+  const paoYakuman = paoCompletedBy(hand, meld);
+  if (paoYakuman) s.pao[seat] = { by: from, yakuman: paoYakuman };
   s.ippatsu = [false, false, false, false]; // 鳴きで全員の一発消滅
   s.turn = seat;
   s.drawnTile = null;
