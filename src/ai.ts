@@ -1,13 +1,14 @@
-// 簡易CPU（Phase 4a/4b 用）。chooseAction(state, seat): Action。
+// 簡易CPU。chooseAction(state, seat): Action。
 // 戦略であってルールではないため core の必須APIとは分離（architecture.md）。
-// v1 ヒューリスティック:
+// v2 ヒューリスティック:
 //  - 和了できるなら和了（ツモ/ロン/槍槓）。
 //  - 鳴き: 役牌(三元/自風/場風)はポン/カン。タンヤオ志向(全簡牌)で聴牌到達ならポン/チー。それ以外は門前維持。
-//  - 打牌: 聴牌到達でリーチ/受け入れ最大 → 孤立牌切り。
-//  向聴数ベースの本格思考は今後（shanten 実装時）に差し替え可能。
+//  - 打牌: 向聴最小 → 受け入れ「枚数」最大（ukeire）→ 残し打点(ドラ/役牌対子)が高い → 孤立牌、の順で選ぶ。
+//         赤は同種なら残す。聴牌でリーチ可能なら宣言。
+//  - 押し引き: 他家リーチ時は shouldPush で押す/降りるを決め、降りるならベタオリ（safestDiscard）。
 import type { Seat, TileKind, Tile, Wind } from './types.js';
 import { tilesToCounts, isYaochu } from './tiles.js';
-import { waits, isTenpai } from './win.js';
+import { isTenpai } from './win.js';
 import { shanten } from './shanten.js';
 import { legalActions, seatWindOf, type GameState, type Action, type PlayerState } from './game.js';
 
@@ -36,11 +37,6 @@ function handAllSimples(hand: PlayerState): boolean {
   return hand.melds.every((m) => m.tiles.every((t) => !isYaochu(t.kind)));
 }
 
-function waitsAfterDiscard(hand: PlayerState, tile: Tile): number {
-  const rest = hand.concealed.filter((t) => t.id !== tile.id);
-  return waits(tilesToCounts(rest), hand.melds.length).length;
-}
-
 function usefulness(counts: number[], kind: TileKind): number {
   let u = counts[kind] * 2;
   if (kind < 27) {
@@ -53,33 +49,47 @@ function usefulness(counts: number[], kind: TileKind): number {
   return u;
 }
 
-function bestByWaits(hand: PlayerState, acts: Action[]): Action {
-  let best = acts[0];
-  let bestW = -1;
-  for (const a of acts) {
-    if (a.type !== 'discard') continue;
-    const w = waitsAfterDiscard(hand, a.tile);
-    if (w > bestW) {
-      bestW = w;
-      best = a;
-    }
+/**
+ * 受け入れ枚数（ukeire）。13枚形 counts から、向聴を縮める有効牌の「残り枚数の合計」。
+ * vis は場に見えている枚数（visibleCounts）。残り = 4 - vis[k]。種類数でなく枚数で測る。
+ */
+export function ukeire(counts: number[], melds: number, vis: number[]): number {
+  const base = shanten(counts, melds);
+  let total = 0;
+  for (let k = 0; k < 34; k++) {
+    if (counts[k] >= 4 || !isRelevant(counts, k)) continue; // 孤立して向聴に効かない牌は走査しない
+    counts[k]++;
+    const after = shanten(counts, melds); // ツモ後14枚の向聴（=有効牌なら base-1）
+    counts[k]--;
+    if (after < base) total += Math.max(0, 4 - vis[k]);
   }
-  return best;
+  return total;
 }
 
-function leastUseful(hand: PlayerState, acts: Action[]): Action {
-  const counts = tilesToCounts(hand.concealed);
-  let best = acts[0];
-  let bestScore = Infinity;
-  for (const a of acts) {
-    if (a.type !== 'discard') continue;
-    const score = usefulness(counts, a.tile.kind) * 10 - (isYaochu(a.tile.kind) ? 1 : 0);
-    if (score < bestScore) {
-      bestScore = score;
-      best = a;
-    }
+/** kind を引いて向聴に効きうるか（同種が手にある／数牌で同色±2に手牌がある）。孤立牌の走査を省く高速化。 */
+function isRelevant(counts: number[], kind: TileKind): boolean {
+  if (counts[kind] > 0) return true;
+  if (kind >= 27) return false; // 孤立した字牌は受けにならない
+  const n = kind % 9;
+  for (let d = 1; d <= 2; d++) {
+    if (n - d >= 0 && counts[kind - d] > 0) return true;
+    if (n + d <= 8 && counts[kind + d] > 0) return true;
   }
-  return best;
+  return false;
+}
+
+/** その種を手に残したい度合い（打点期待）。ドラ＝強く残す、役牌の対子＝残す。同効率時のタイブレーク用。 */
+function keepValue(state: GameState, seat: Seat, counts: number[], kind: TileKind): number {
+  let v = 0;
+  for (const ind of state.doraIndicators) if (doraKindOf(ind.kind) === kind) v += 3;
+  if (isYakuhai(state, seat, kind) && counts[kind] >= 2) v += 2;
+  return v;
+}
+
+/** 種 kind を切るとき、赤を残すため非赤の現物を優先して選ぶ。 */
+function pickTileToDiscard(discards: Action[], kind: TileKind): Action {
+  const same = discards.filter((a) => a.type === 'discard' && !a.riichi && a.tile.kind === kind);
+  return same.find((a) => a.type === 'discard' && !a.tile.red) ?? same[0];
 }
 
 /** タンヤオ志向で、聴牌に到達する全簡牌のポン/チーを1つ選ぶ（なければ null）。 */
@@ -239,20 +249,20 @@ export function chooseAction(state: GameState, seat: Seat): Action {
   const melds = hand.melds.length;
   const discards = acts.filter((a) => a.type === 'discard');
 
-  // 各打牌候補（種ごと）について、切った後の向聴数を求める
+  // まず向聴だけを各候補（種ごと）で求める。受け入れ枚数は重いので向聴最小の候補のみ後で計算する。
+  const baseCounts = tilesToCounts(hand.concealed);
   const seen = new Set<TileKind>();
-  const byTile: { act: Action; kind: TileKind; sh: number }[] = [];
+  const byTile: { kind: TileKind; sh: number; rest: number[] }[] = [];
   for (const a of discards) {
     if (a.type !== 'discard' || a.riichi || seen.has(a.tile.kind)) continue;
     seen.add(a.tile.kind);
-    const rest = tilesToCounts(hand.concealed);
+    const rest = baseCounts.slice();
     rest[a.tile.kind]--;
-    byTile.push({ act: a, kind: a.tile.kind, sh: shanten(rest, melds) });
+    byTile.push({ kind: a.tile.kind, sh: shanten(rest, melds), rest });
   }
   if (byTile.length === 0) return discards[0]; // 念のため
 
   const minSh = Math.min(...byTile.map((b) => b.sh));
-  const bestActs = byTile.filter((b) => b.sh === minSh).map((b) => b.act);
 
   // 押し引き: 他家リーチがあり、押す価値が無ければ降りる（手の価値・巡目・点棒で判断）
   const threats = ([0, 1, 2, 3] as Seat[]).filter((o) => o !== seat && state.riichi[o]);
@@ -260,15 +270,23 @@ export function chooseAction(state: GameState, seat: Seat): Action {
     return safestDiscard(state, seat, hand, discards, threats);
   }
 
+  // 向聴最小の中から打牌を選ぶ。受け入れ枚数が効くのは終盤(1〜2向聴)なのでそこだけ ukeire を計算し、
+  // 3向聴以上は孤立牌→残し打点の軽量ヒューリスティックで選ぶ（shanten 連打を避ける高速化）。
+  const tied = byTile.filter((b) => b.sh === minSh);
+  const vis = visibleCounts(state, seat);
+  const scored = tied.map((b) => ({
+    kind: b.kind,
+    // 受け入れ枚数が効くのは終盤(1〜2向聴)かつ候補が割れた時だけ。それ以外は計算を省く。
+    uke: minSh <= 2 && tied.length > 1 ? ukeire(b.rest, melds, vis) : 0,
+    keep: keepValue(state, seat, baseCounts, b.kind),
+    use: usefulness(baseCounts, b.kind),
+  }));
+  const best = scored.sort((a, b) => b.uke - a.uke || a.keep - b.keep || a.use - b.use)[0];
+
   if (minSh === 0) {
-    // 聴牌: リーチ可能なら宣言（受け入れ最大）、不可なら受け入れ最大で打牌
-    const riichiKinds = new Set(bestActs.map((a) => (a.type === 'discard' ? a.tile.kind : -1)));
-    const riichiActs = discards.filter(
-      (a) => a.type === 'discard' && a.riichi && riichiKinds.has(a.tile.kind),
-    );
-    if (riichiActs.length > 0) return bestByWaits(hand, riichiActs);
-    return bestByWaits(hand, bestActs);
+    // 聴牌: リーチ可能ならその種で宣言、不可なら通常打牌（赤は残す）。
+    const riichi = discards.find((a) => a.type === 'discard' && a.riichi && a.tile.kind === best.kind);
+    if (riichi) return riichi;
   }
-  // 向聴を縮める打牌の中で、最も孤立した牌を切る
-  return leastUseful(hand, bestActs);
+  return pickTileToDiscard(discards, best.kind);
 }
