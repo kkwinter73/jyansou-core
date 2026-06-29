@@ -2,13 +2,13 @@
 // 戦略であってルールではないため core の必須APIとは分離（architecture.md）。
 // v2 ヒューリスティック:
 //  - 和了できるなら和了（ツモ/ロン/槍槓）。
-//  - 鳴き: 役牌(三元/自風/場風)はポン/カン。タンヤオ志向(全簡牌)で聴牌到達ならポン/チー。それ以外は門前維持。
+//  - 鳴き: 役が確定する鳴きのみ。役牌はポン(大明槓せず・アンコ温存)、タンヤオ志向は聴牌到達か打点ありで開く。
+//         鳴いて向聴が悪化するなら見送り。他家リーチ中は聴牌になる鳴きのみ(守備優先)。
 //  - 打牌: 向聴最小 → 受け入れ「枚数」最大（ukeire）→ 残し打点(ドラ/役牌対子)が高い → 孤立牌、の順で選ぶ。
 //         赤は同種なら残す。聴牌でリーチ可能なら宣言。
 //  - 押し引き: 他家リーチ時は shouldPush で押す/降りるを決め、降りるならベタオリ（safestDiscard）。
 import type { Seat, TileKind, Tile, Wind } from './types.js';
 import { tilesToCounts, isYaochu } from './tiles.js';
-import { isTenpai } from './win.js';
 import { shanten } from './shanten.js';
 import { legalActions, seatWindOf, type GameState, type Action, type PlayerState } from './game.js';
 
@@ -19,17 +19,6 @@ function isYakuhai(state: GameState, seat: Seat, kind: TileKind): boolean {
   return kind === WIND_KIND[seatWindOf(state, seat)] || kind === WIND_KIND[state.wind];
 }
 
-/** counts(手の内) が melds 個の確定面子のもとで聴牌可能か（1枚切れば聴牌になる形か）。 */
-function tenpaiable(counts: number[], melds: number): boolean {
-  for (let k = 0; k < 34; k++) {
-    if (counts[k] === 0) continue;
-    counts[k]--;
-    const t = isTenpai(counts, melds);
-    counts[k]++;
-    if (t) return true;
-  }
-  return false;
-}
 
 /** 手牌（手の内＋既存面子）がすべて簡牌（么九なし）か。タンヤオ志向の判定。 */
 function handAllSimples(hand: PlayerState): boolean {
@@ -92,28 +81,64 @@ function pickTileToDiscard(discards: Action[], kind: TileKind): Action {
   return same.find((a) => a.type === 'discard' && !a.tile.red) ?? same[0];
 }
 
-/** タンヤオ志向で、聴牌に到達する全簡牌のポン/チーを1つ選ぶ（なければ null）。 */
-function tanyaoCall(state: GameState, seat: Seat, acts: Action[]): Action | null {
-  const hand = state.hands[seat];
-  if (!handAllSimples(hand)) return null;
-  const calledKind = state.lastDiscard!.tile.kind;
-  if (isYaochu(calledKind)) return null;
+/** 鳴き a（ポン/チー）を実行した後の向聴数。calledKind は鳴いた牌の種。 */
+function shantenAfterCall(hand: PlayerState, a: Action, calledKind: TileKind): number {
+  const c = tilesToCounts(hand.concealed);
+  if (a.type === 'pon') c[calledKind] -= 2;
+  else if (a.type === 'chi') {
+    c[a.tiles[0].kind]--;
+    c[a.tiles[1].kind]--;
+  }
+  return shanten(c, hand.melds.length + 1);
+}
 
-  for (const a of acts) {
-    if (a.type === 'pon') {
-      const counts = tilesToCounts(hand.concealed);
-      counts[calledKind] -= 2;
-      if (tenpaiable(counts, hand.melds.length + 1)) return a;
-    } else if (a.type === 'chi') {
-      const kinds = [a.tiles[0].kind, a.tiles[1].kind, calledKind];
-      if (kinds.some((k) => isYaochu(k))) continue;
-      const counts = tilesToCounts(hand.concealed);
-      counts[a.tiles[0].kind]--;
-      counts[a.tiles[1].kind]--;
-      if (tenpaiable(counts, hand.melds.length + 1)) return a;
+/**
+ * 鳴きの判断（afterDiscard 用）。**役が確定する鳴きだけ**を候補にする（役牌ポン／タンヤオ志向）。
+ *  - 役牌: アガリ牌でアンコが既にある場合や大明槓はしない（アンコ温存・大明槓は損）。ポンのみ。
+ *  - タンヤオ: 全簡牌で、么九を含まない順子/刻子。聴牌到達、または打点(ドラ)があり向聴が進むなら鳴く。
+ *  - 共通: 鳴いて向聴が悪化するなら見送り。他家リーチ中は聴牌になる鳴きのみ（守備優先）。
+ */
+function chooseCall(state: GameState, seat: Seat, acts: Action[]): Action {
+  const pass: Action = { type: 'pass', seat };
+  const hand = state.hands[seat];
+  const calledKind = state.lastDiscard!.tile.kind;
+  const concealed = tilesToCounts(hand.concealed);
+  const shBefore = shanten(concealed, hand.melds.length);
+  const value = handValue(state, hand);
+  const underThreat = ([0, 1, 2, 3] as Seat[]).some((o) => o !== seat && state.riichi[o]);
+
+  const cands: { act: Action; sh: number }[] = [];
+
+  // 役牌ポン（大明槓はしない／既にアンコなら鳴かずアンコ温存）
+  if (isYakuhai(state, seat, calledKind) && concealed[calledKind] === 2) {
+    const pon = acts.find((a) => a.type === 'pon');
+    if (pon) cands.push({ act: pon, sh: shantenAfterCall(hand, pon, calledKind) });
+  }
+
+  // タンヤオ志向（全簡牌・喰い下がってもタンヤオ役が残る）
+  if (handAllSimples(hand) && !isYaochu(calledKind)) {
+    for (const a of acts) {
+      if (a.type === 'pon') {
+        cands.push({ act: a, sh: shantenAfterCall(hand, a, calledKind) });
+      } else if (a.type === 'chi') {
+        if ([a.tiles[0].kind, a.tiles[1].kind].some(isYaochu)) continue; // 么九を含む順子はタンヤオにならない
+        cands.push({ act: a, sh: shantenAfterCall(hand, a, calledKind) });
+      }
     }
   }
-  return null;
+  if (cands.length === 0) return pass;
+
+  const best = cands.sort((x, y) => x.sh - y.sh)[0];
+
+  if (best.sh > shBefore) return pass; // 鳴いて向聴が悪化するなら見送り
+  if (underThreat) return best.sh === 0 ? best.act : pass; // リーチ中は聴牌になる鳴きのみ
+  if (best.sh === 0) return best.act; // 聴牌は鳴く
+  if (best.sh < shBefore) {
+    // 向聴が進む鳴き。役牌は速度重視で鳴く。タンヤオは打点(ドラ/赤)があるときだけ開く。
+    const isYakuhaiPon = best.act.type === 'pon' && isYakuhai(state, seat, calledKind);
+    if (isYakuhaiPon || value >= 2) return best.act;
+  }
+  return pass;
 }
 
 /** 見えている牌の枚数（自分の手牌+全副露+全河+ドラ表示）。壁/字牌残数の判定に使う。 */
@@ -226,18 +251,7 @@ export function chooseAction(state: GameState, seat: Seat): Action {
     if (ron) return ron;
     if (state.phase === 'afterKakan') return { type: 'pass', seat };
 
-    const calledKind = state.lastDiscard!.tile.kind;
-    // 役牌はポン/カン（確定役・速度）
-    if (isYakuhai(state, seat, calledKind)) {
-      const kan = acts.find((a) => a.type === 'kan');
-      if (kan) return kan;
-      const pon = acts.find((a) => a.type === 'pon');
-      if (pon) return pon;
-    }
-    // タンヤオ志向の鳴き
-    const call = tanyaoCall(state, seat, acts);
-    if (call) return call;
-    return { type: 'pass', seat };
+    return chooseCall(state, seat, acts);
   }
 
   // discard 局面
